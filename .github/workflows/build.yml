@@ -28,19 +28,26 @@ jobs:
 
       - name: Xiaomi 4.19 Hard-Fix (ReSukiSU Compatibility)
         run: |
-          # 1. Fix Redefinition: Put 'extern' in header, 'definition' in C files
-          sed -i '1i extern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;' include/linux/fs.h
-          
+          # 1. Fix Declarations in include/linux/fs.h
+          # We create a temporary file with our declarations and prepend it to the header
+          cat <<EOF > fs_hooks.h
+          extern void *vfs_read_target;
+          extern void *vfs_write_target;
+          extern void *do_execve_target;
+          EOF
+          cat fs_hooks.h include/linux/fs.h > include/linux/fs.h.new
+          mv include/linux/fs.h.new include/linux/fs.h
+
+          # 2. Define and Export in C files (Appending to the end is safer)
           echo 'void *vfs_read_target = NULL; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
           echo 'void *vfs_write_target = NULL; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
           echo 'void *do_execve_target = NULL; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
 
-          # 2. Fix KPROBE_HIT_ACTIVE (Version mismatch for 4.19)
-          # We define the missing identifier for the compiler
+          # 3. Fix KPROBE_HIT_ACTIVE for 4.19 Kernels
+          # We use a simple sed to insert the define at line 1
           sed -i '1i #define KPROBE_HIT_ACTIVE 1' drivers/kernelsu/kpm.c
 
-          # 3. Fix init_user_ns (Missing Namespace header)
-          # We force include the namespace header in KernelSU's main file
+          # 4. Fix Namespace inclusion in ReSukiSU
           sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
 
       - name: Build Kernel
@@ -52,8 +59,10 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
+          # Use your specific chime-stock_defconfig
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
+          # Full Build
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
