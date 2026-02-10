@@ -23,46 +23,38 @@ jobs:
 
       - name: Manual ReSukiSU Integration
         run: |
-          # 1. Clone ReSukiSU into drivers/kernelsu
+          # 1. Clone ReSukiSU
           git clone https://github.com/ReSukiSU/ReSukiSU.git drivers/kernelsu --depth=1
           
-          # 2. ReSukiSU stores its kernel code in the 'kernel' subfolder. 
-          # We move it to the root of drivers/kernelsu so the Makefile finds it.
+          # 2. Move kernel source files to the driver root
           mv drivers/kernelsu/kernel/* drivers/kernelsu/
           
-          # 3. Add to drivers/Makefile if not already there
-          if ! grep -q "obj-y += kernelsu/" drivers/Makefile; then
+          # 3. Add to the kernel build system
+          if !<!--citation:1--> grep -q "obj-y += kernelsu/" drivers/Makefile; then
             echo "obj-y += kernelsu/" >> drivers/Makefile
           fi
-          
-          # 4. Add to drivers/Kconfig if not already there
           if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
             sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
-      - name: Xiaomi 4.19 "Smart-Fix" (Hooks & KPM)
+      - name: Xiaomi 4.19 "Undeclared Identifier" Fix
         run: |
-          # This step fixes the "vfs_read_target" and "KPROBE_HIT_ACTIVE" errors
+          # This specifically fixes the KPROBE_HIT_ACTIVE error from your logs
           
-          # Fix include/linux/fs.h
-          if ! grep -q "vfs_read_target" include/linux/fs.h; then
-            sed -i '1i extern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;' include/linux/fs.h
-          fi
+          # Fix KPM.c: Define the missing constant at the very top
+          echo -e "#define KPROBE_HIT_ACTIVE 1\n$(cat drivers/kernelsu/kpm.c)" > drivers/kernelsu/kpm.c
+          
+          # Fix KSU.c: Add missing namespace header
+          echo -e "#include <linux/user_namespace.h>\n$(cat drivers/kernelsu/ksu.c)" > drivers/kernelsu/ksu.c
 
-          # Fix definitions in fs/ core files
+          # Fix Hooks: Manually declare the variables that Xiaomi is missing
+          # We add them to include/linux/fs.h to ensure they are visible globally
+          echo -e "extern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;\n$(cat include/linux/fs.h)" > include/linux/fs.h
+          
+          # Define and Export them in the filesystem core
           echo 'void *vfs_read_target = NULL; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
           echo 'void *vfs_write_target = NULL; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
           echo 'void *do_execve_target = NULL; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
-
-          # Fix KPM redefinition (prevents the 'kpm.c' error you saw)
-          if [ -f drivers/kernelsu/kpm.c ]; then
-            sed -i '1i #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
-          fi
-
-          # Fix Namespace inclusion in ReSukiSU
-          if [ -f drivers/kernelsu/ksu.c ]; then
-            sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
-          fi
 
       - name: Build Kernel
         run: |
@@ -73,8 +65,10 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
+          # Use your specific chime-stock_defconfig
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
+          # Full Build with Clang
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
