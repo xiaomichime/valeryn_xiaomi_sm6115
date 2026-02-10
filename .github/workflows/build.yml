@@ -23,23 +23,25 @@ jobs:
 
       - name: Integrate ReSukiSU
         run: |
-          # Step A: Download ReSukiSU source
+          # Download ReSukiSU source
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
 
-      - name: Fix ReSukiSU Manual Hooks (The "vfs_read_target" Error)
+      - name: Xiaomi 4.19 Hard-Fix (ReSukiSU Compatibility)
         run: |
-          # Step B: Manually define the variables ReSukiSU needs in the kernel core
-          # We add these to the top of the files to ensure the compiler sees them
+          # 1. Fix Redefinition: Put 'extern' in header, 'definition' in C files
+          sed -i '1i extern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;' include/linux/fs.h
           
-          # Fix include/linux/fs.h (Declaration)
-          sed -i '1i void *vfs_read_target = NULL;\nvoid *vfs_write_target = NULL;\nvoid *do_execve_target = NULL;' include/linux/fs.h
-          
-          # Fix fs/read_write.c (Exporting for the module)
-          echo 'extern void *vfs_read_target; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
-          echo 'extern void *vfs_write_target; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
-          
-          # Fix fs/exec.c (Exporting for the module)
-          echo 'extern void *do_execve_target; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
+          echo 'void *vfs_read_target = NULL; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
+          echo 'void *vfs_write_target = NULL; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          echo 'void *do_execve_target = NULL; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
+
+          # 2. Fix KPROBE_HIT_ACTIVE (Version mismatch for 4.19)
+          # We define the missing identifier for the compiler
+          sed -i '1i #define KPROBE_HIT_ACTIVE 1' drivers/kernelsu/kpm.c
+
+          # 3. Fix init_user_ns (Missing Namespace header)
+          # We force include the namespace header in KernelSU's main file
+          sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
 
       - name: Build Kernel
         run: |
@@ -50,10 +52,8 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
-          # Use your specific defconfig
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
-          # Build with Proton Clang and LLD Linker
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
@@ -72,8 +72,6 @@ jobs:
       - name: Package with AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git --depth=1
-          
-          # Copy the built kernel image (standard Chime output is Image.gz-dtb)
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           elif [ -f out/arch/arm64/boot/Image.gz ]; then
@@ -81,9 +79,7 @@ jobs:
           else
             cp out/arch/arm64/boot/Image AnyKernel3/
           fi
-          
           cd AnyKernel3
-          # Set device names for Xiaomi Chime/Citrus
           sed -i 's/device.name1=.*/device.name1=chime/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
           zip -r ../ReSukiSU-Kernel-Chime.zip *
