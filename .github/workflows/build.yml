@@ -1,4 +1,4 @@
-name: Build ReSukiSU Kernel (Android 16 Branch)
+name: Build ReSukiSU Kernel (Android 16)
 on:
   workflow_dispatch:
 
@@ -6,41 +6,69 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Kernel Source (android16)
+      - name: Checkout Kernel Source
         uses: actions/checkout@v4
         with:
-          ref: android16 # This tells the runner to use your android16 branch
+          ref: android16
           fetch-depth: 1
 
-      - name: Install Dependencies
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential flex bison lzip libssl-dev libelf-dev clang llvm lld
+          sudo apt-get install -y bc build-essential flex bison lzip libssl-dev libelf-dev clang llvm lld libidn11
 
-      - name: Set up Toolchain (AOSP Clang)
+      - name: Set up Proton Clang
         run: |
-          mkdir toolchain
-          cd toolchain
-          # Using Clang r450784d which is stable for 4.19 kernels
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784d.tar.gz
-          tar -xf clang-r450784d.tar.gz
-          echo "$(pwd)/bin" >> $GITHUB_PATH
+          git clone https://github.com/kdrag0n/proton-clang.git --depth=1 toolchain
+          echo "$(pwd)/toolchain/bin" >> $GITHUB_PATH
 
       - name: Integrate ReSukiSU
         run: |
-          # The script automatically downloads KSU/KPM source and patches the drivers
+          # The script adds KernelSU/KPM source code and patches your drivers automatically
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
 
       - name: Build Kernel
         run: |
           export ARCH=arm64
+          # Proton Clang uses these prefixes
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           
-          # Use the specific chime-stock_defconfig you mentioned
+          # Use your verified chime-stock_defconfig
           make O=out vendor/chime-stock_defconfig
           
           make -j$(nproc --all) O=out \
+                      CC=clang \
+                      AR=llvm-ar \
+                      NM=llvm-nm \
+                      OBJCOPY=llvm-objcopy \
+                      OBJDUMP=llvm-objdump \
+                      STRIP=llvm-strip \
+                      CROSS_COMPILE=aarch64-linux-gnu- \
+                      CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git --depth=1
+          # Check for the correct boot image output
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          else
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          fi
+          
+          cd AnyKernel3
+          sed -i 's/device.name1=.*/device.name1=chime/' anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
+          zip -r ../ReSukiSU-Kernel-Chime.zip *
+
+      - name: Upload Flashable Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-Kernel-Chime
+          path: ReSukiSU-Kernel-Chime.zip          make -j$(nproc --all) O=out \
                       CC=clang \
                       CLANG_TRIPLE=aarch64-linux-gnu- \
                       CROSS_COMPILE=aarch64-linux-gnu- \
