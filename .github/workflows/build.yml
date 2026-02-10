@@ -21,36 +21,46 @@ jobs:
         run: |
           git clone https://github.com/kdrag0n/proton-clang.git --depth=1 toolchain
 
-      - name: Integrate ReSukiSU
+      - name: Manual ReSukiSU Integration
         run: |
-          # Step A: Download ReSukiSU source code
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
+          # 1. Clone ReSukiSU into drivers/kernelsu
+          git clone https://github.com/ReSukiSU/ReSukiSU.git drivers/kernelsu --depth=1
+          
+          # 2. ReSukiSU stores its kernel code in the 'kernel' subfolder. 
+          # We move it to the root of drivers/kernelsu so the Makefile finds it.
+          mv drivers/kernelsu/kernel/* drivers/kernelsu/
+          
+          # 3. Add to drivers/Makefile if not already there
+          if ! grep -q "obj-y += kernelsu/" drivers/Makefile; then
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+          fi
+          
+          # 4. Add to drivers/Kconfig if not already there
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
 
-      - name: Xiaomi 4.19 Smart-Fix
+      - name: Xiaomi 4.19 "Smart-Fix" (Hooks & KPM)
         run: |
-          # 1. Fix include/linux/fs.h (Declarations)
-          # Only add if not already present to avoid redefinition
+          # This step fixes the "vfs_read_target" and "KPROBE_HIT_ACTIVE" errors
+          
+          # Fix include/linux/fs.h
           if ! grep -q "vfs_read_target" include/linux/fs.h; then
             sed -i '1i extern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;' include/linux/fs.h
           fi
 
-          # 2. Fix fs/read_write.c (Definitions)
-          if ! grep -q "void *vfs_read_target =" fs/read_write.c; then
-            echo 'void *vfs_read_target = NULL; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
-            echo 'void *vfs_write_target = NULL; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          # Fix definitions in fs/ core files
+          echo 'void *vfs_read_target = NULL; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
+          echo 'void *vfs_write_target = NULL; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          echo 'void *do_execve_target = NULL; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
+
+          # Fix KPM redefinition (prevents the 'kpm.c' error you saw)
+          if [ -f drivers/kernelsu/kpm.c ]; then
+            sed -i '1i #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
           fi
 
-          # 3. Fix fs/exec.c (Definitions)
-          if ! grep -q "void *do_execve_target =" fs/exec.c; then
-            echo 'void *do_execve_target = NULL; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
-          fi
-
-          # 4. Fix KPROBE_HIT_ACTIVE in drivers/kernelsu/kpm.c
-          # Use a guard to prevent redefinition errors
-          sed -i '1i #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
-
-          # 5. Fix User Namespace in drivers/kernelsu/ksu.c
-          if ! grep -q "user_namespace.h" drivers/kernelsu/ksu.c; then
+          # Fix Namespace inclusion in ReSukiSU
+          if [ -f drivers/kernelsu/ksu.c ]; then
             sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
           fi
 
@@ -63,10 +73,8 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
-          # Generate config
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
-          # Build process
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
@@ -85,13 +93,10 @@ jobs:
       - name: Package with AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git --depth=1
-          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-          elif [ -f out/arch/arm64/boot/Image.gz ]; then
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          else
-            cp out/arch/arm64/boot/Image AnyKernel3/
-          fi
+          [ -f out/arch/arm64/boot/Image.gz-dtb ] && cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          [ -f out/arch/arm64/boot/Image.gz ] && cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          [ -f out/arch/arm64/boot/Image ] && cp out/arch/arm64/boot/Image AnyKernel3/
+          
           cd AnyKernel3
           sed -i 's/device.name1=.*/device.name1=chime/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
