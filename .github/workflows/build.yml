@@ -21,42 +21,39 @@ jobs:
         run: |
           git clone https://github.com/kdrag0n/proton-clang.git --depth=1 toolchain
 
-      - name: Manual ReSukiSU Integration
+      - name: Manual ReSukiSU Integration (Guaranteed Pathing)
         run: |
-          # 1. Clean and Clone
+          # 1. Clean and Clone ReSukiSU
           rm -rf drivers/kernelsu
           git clone https://github.com/ReSukiSU/ReSukiSU.git drivers/kernelsu --depth=1
           
-          # 2. Move source files to driver root
-          mv drivers/kernelsu/kernel/* drivers/kernelsu/
+          # 2. Fix the folder structure (Move everything from 'kernel' to root of drivers/kernelsu)
+          if [ -d "drivers/kernelsu/kernel" ]; then
+            cp -r drivers/kernelsu/kernel/* drivers/kernelsu/
+          fi
           
-          # 3. Add to build system if missing
-          grep -q "obj-y += kernelsu/" drivers/Makefile || echo "obj-y += kernelsu/" >> drivers/Makefile
-          grep -q "kernelsu/Kconfig" drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          # 3. Inject ReSukiSU into the build system
+          echo "obj-y += kernelsu/" >> drivers/Makefile
+          # Add Kconfig source before the last 'endmenu' or at the end
+          sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-      - name: Surgical Source Patching (Fixes Redefinition & Undeclared)
+      - name: Ultimate Xiaomi 4.19 Fix (No Redefinitions)
         run: |
-          # 1. Fix include/linux/fs.h (The DECLARATIONS)
-          # We use a guard to ensure we never add these more than once
-          if ! grep -q "extern void *vfs_read_target;" include/linux/fs.h; then
-            sed -i '1i #ifndef _RESUKISU_H_HOOKS\n#define _RESUKISU_H_HOOKS\nextern void *vfs_read_target;\nextern void *vfs_write_target;\nextern void *do_execve_target;\n#endif' include/linux/fs.h
+          # 1. Fix KPROBE_HIT_ACTIVE directly in the KPM source (Fixes your KPM error)
+          # We check if the file exists first
+          if [ -f drivers/kernelsu/kpm.c ]; then
+            sed -i '1i #define KPROBE_HIT_ACTIVE 1' drivers/kernelsu/kpm.c
           fi
 
-          # 2. Fix fs/read_write.c and fs/exec.c (The DEFINITIONS)
-          # We check if the symbol is already exported to prevent redefinition errors
-          grep -q "EXPORT_SYMBOL(vfs_read_target);" fs/read_write.c || echo -e 'void *vfs_read_target = NULL;\nEXPORT_SYMBOL(vfs_read_target);\nvoid *vfs_write_target = NULL;\nEXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
-          grep -q "EXPORT_SYMBOL(do_execve_target);" fs/exec.c || echo -e 'void *do_execve_target = NULL;\nEXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
-
-          # 3. Fix KPROBE_HIT_ACTIVE for 4.19 kernels
-          # We define it directly at the start of the failing file
-          if ! grep -q "#define KPROBE_HIT_ACTIVE 1" drivers/kernelsu/kpm.c; then
-            sed -i '1i #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
-          fi
-
-          # 4. Fix User Namespace inclusion
-          if ! grep -q "user_namespace.h" drivers/kernelsu/ksu.c; then
+          # 2. Fix Namespace inclusion in KSU (Fixes init_user_ns error)
+          if [ -f drivers/kernelsu/ksu.c ]; then
             sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
           fi
+
+          # 3. Create the Hooks manually in the core kernel files
+          # We append these to the end to avoid conflicts with existing headers
+          echo -e '\nvoid *vfs_read_target = NULL;\nEXPORT_SYMBOL(vfs_read_target);\nvoid *vfs_write_target = NULL;\nEXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          echo -e '\nvoid *do_execve_target = NULL;\nEXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
 
       - name: Build Kernel
         run: |
@@ -67,8 +64,11 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
+          # Step 1: Config
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
+          # Step 2: Build
+          # We pass KCFLAGS to define the hooks globally for all files
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
@@ -82,7 +82,8 @@ jobs:
                       CROSS_COMPILE=aarch64-linux-gnu- \
                       CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
                       HOSTCC=gcc \
-                      HOSTCXX=g++
+                      HOSTCXX=g++ \
+                      KCFLAGS="-Dvfs_read_target=vfs_read_target -Dvfs_write_target=vfs_write_target -Ddo_execve_target=do_execve_target"
 
       - name: Package with AnyKernel3
         run: |
@@ -90,7 +91,6 @@ jobs:
           [ -f out/arch/arm64/boot/Image.gz-dtb ] && cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           [ -f out/arch/arm64/boot/Image.gz ] && cp out/arch/arm64/boot/Image.gz AnyKernel3/
           [ -f out/arch/arm64/boot/Image ] && cp out/arch/arm64/boot/Image AnyKernel3/
-          
           cd AnyKernel3
           sed -i 's/device.name1=.*/device.name1=chime/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
