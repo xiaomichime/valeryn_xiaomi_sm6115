@@ -21,39 +21,47 @@ jobs:
         run: |
           git clone https://github.com/kdrag0n/proton-clang.git --depth=1 toolchain
 
-      - name: Manual ReSukiSU Integration (Guaranteed Pathing)
+      - name: Clean and Integrate ReSukiSU
         run: |
-          # 1. Clean and Clone ReSukiSU
+          # 1. Ensure a clean state
+          git checkout -- .
           rm -rf drivers/kernelsu
+          
+          # 2. Clone ReSukiSU
           git clone https://github.com/ReSukiSU/ReSukiSU.git drivers/kernelsu --depth=1
           
-          # 2. Fix the folder structure (Move everything from 'kernel' to root of drivers/kernelsu)
-          if [ -d "drivers/kernelsu/kernel" ]; then
-            cp -r drivers/kernelsu/kernel/* drivers/kernelsu/
-          fi
-          
-          # 3. Inject ReSukiSU into the build system
+          # 3. Move files and update build system
+          mv drivers/kernelsu/kernel/* drivers/kernelsu/
           echo "obj-y += kernelsu/" >> drivers/Makefile
-          # Add Kconfig source before the last 'endmenu' or at the end
           sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-      - name: Ultimate Xiaomi 4.19 Fix (No Redefinitions)
+      - name: Global Hook Surgery (Fixes Redefinition & Visibility)
         run: |
-          # 1. Fix KPROBE_HIT_ACTIVE directly in the KPM source (Fixes your KPM error)
-          # We check if the file exists first
-          if [ -f drivers/kernelsu/kpm.c ]; then
-            sed -i '1i #define KPROBE_HIT_ACTIVE 1' drivers/kernelsu/kpm.c
-          fi
+          # 1. Create a dedicated header so all files see the same variables
+          cat <<EOF > include/linux/ksu_hooks.h
+          #ifndef _KSU_HOOKS_H
+          #define _KSU_HOOKS_H
+          #include <linux/types.h>
+          extern void *vfs_read_target;
+          extern void *vfs_write_target;
+          extern void *do_execve_target;
+          #endif
+          EOF
 
-          # 2. Fix Namespace inclusion in KSU (Fixes init_user_ns error)
-          if [ -f drivers/kernelsu/ksu.c ]; then
-            sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
-          fi
+          # 2. Inject this header into the ReSukiSU hooks file
+          sed -i '1i #include <linux/ksu_hooks.h>' drivers/kernelsu/hooks.c
+          
+          # 3. Define and Export variables in the core (Reset files first to prevent redefinition)
+          git checkout -- fs/read_write.c fs/exec.c
+          echo -e '\n#include <linux/ksu_hooks.h>\nvoid *vfs_read_target = NULL;\nEXPORT_SYMBOL(vfs_read_target);\nvoid *vfs_write_target = NULL;\nEXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          echo -e '\n#include <linux/ksu_hooks.h>\nvoid *do_execve_target = NULL;\nEXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
 
-          # 3. Create the Hooks manually in the core kernel files
-          # We append these to the end to avoid conflicts with existing headers
-          echo -e '\nvoid *vfs_read_target = NULL;\nEXPORT_SYMBOL(vfs_read_target);\nvoid *vfs_write_target = NULL;\nEXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
-          echo -e '\nvoid *do_execve_target = NULL;\nEXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
+          # 4. Fix KPROBE_HIT_ACTIVE specifically for 4.19
+          # We use 'sed' to insert it AFTER the includes in kpm.c
+          sed -i '/#include/a #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
+
+          # 5. Fix Namespace error
+          sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
 
       - name: Build Kernel
         run: |
@@ -64,11 +72,8 @@ jobs:
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
-          # Step 1: Config
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
-          # Step 2: Build
-          # We pass KCFLAGS to define the hooks globally for all files
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
@@ -82,8 +87,7 @@ jobs:
                       CROSS_COMPILE=aarch64-linux-gnu- \
                       CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
                       HOSTCC=gcc \
-                      HOSTCXX=g++ \
-                      KCFLAGS="-Dvfs_read_target=vfs_read_target -Dvfs_write_target=vfs_write_target -Ddo_execve_target=do_execve_target"
+                      HOSTCXX=g++
 
       - name: Package with AnyKernel3
         run: |
@@ -96,8 +100,8 @@ jobs:
           sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
           zip -r ../ReSukiSU-Kernel-Chime.zip *
 
-      - name: Upload Flashable Kernel
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-Kernel-Chime
+          name: ReSukiSU-Kernel
           path: ReSukiSU-Kernel-Chime.zip
