@@ -23,24 +23,37 @@ jobs:
 
       - name: Integrate ReSukiSU
         run: |
-          # Automatically patches your source code to include ReSukiSU and KPM
+          # Step A: Download ReSukiSU source
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s nongki
+
+      - name: Fix ReSukiSU Manual Hooks (The "vfs_read_target" Error)
+        run: |
+          # Step B: Manually define the variables ReSukiSU needs in the kernel core
+          # We add these to the top of the files to ensure the compiler sees them
+          
+          # Fix include/linux/fs.h (Declaration)
+          sed -i '1i void *vfs_read_target = NULL;\nvoid *vfs_write_target = NULL;\nvoid *do_execve_target = NULL;' include/linux/fs.h
+          
+          # Fix fs/read_write.c (Exporting for the module)
+          echo 'extern void *vfs_read_target; EXPORT_SYMBOL(vfs_read_target);' >> fs/read_write.c
+          echo 'extern void *vfs_write_target; EXPORT_SYMBOL(vfs_write_target);' >> fs/read_write.c
+          
+          # Fix fs/exec.c (Exporting for the module)
+          echo 'extern void *do_execve_target; EXPORT_SYMBOL(do_execve_target);' >> fs/exec.c
 
       - name: Build Kernel
         run: |
-          # Define absolute path to toolchain
           TC_DIR=$(pwd)/toolchain/bin
-          
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           export KBUILD_BUILD_USER="Valeryn"
           export KBUILD_BUILD_HOST="Github-Actions"
 
-          # Step 1: Generate the config using system tools
+          # Use your specific defconfig
           make O=out ARCH=arm64 vendor/chime-stock_defconfig
           
-          # Step 2: Build using Proton Clang but keeping Host tools as system GCC
+          # Build with Proton Clang and LLD Linker
           make -j$(nproc --all) O=out \
                       ARCH=arm64 \
                       CC=$TC_DIR/clang \
@@ -60,16 +73,17 @@ jobs:
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git --depth=1
           
-          # Find the generated kernel image
+          # Copy the built kernel image (standard Chime output is Image.gz-dtb)
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           elif [ -f out/arch/arm64/boot/Image.gz ]; then
             cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          elif [ -f out/arch/arm64/boot/Image ]; then
+          else
             cp out/arch/arm64/boot/Image AnyKernel3/
           fi
           
           cd AnyKernel3
+          # Set device names for Xiaomi Chime/Citrus
           sed -i 's/device.name1=.*/device.name1=chime/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=citrus/' anykernel.sh
           zip -r ../ReSukiSU-Kernel-Chime.zip *
