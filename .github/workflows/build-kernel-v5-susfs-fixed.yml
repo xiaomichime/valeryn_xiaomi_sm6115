@@ -1,0 +1,845 @@
+# GitHub Actions Workflow for building Xiaomi SM6115 Kernel with ReSukiSU + SUSFS
+# Repository: xiaomichime/valeryn_xiaomi_sm6115
+# ReSukiSU: https://github.com/ReSukiSU/ReSukiSU
+# SUSFS: https://gitlab.com/simonpunk/susfs4ksu
+#
+# This version (v5) includes:
+# - FIXED: Proper SUSFS kernel patching for Non-GKI kernels
+# - FIXED: SUSFS source file integration (not just patches)
+# - FIXED: SUSFS-KernelSU kernel module integration
+# - FIXED: Kconfig path resolution
+# - Improved error handling and verification
+# - Toolchain caching for faster builds
+# - Better SUSFS config option handling
+
+name: Build Kernel with ReSukiSU + SUSFS
+
+on:
+  push:
+    branches:
+      - android16
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  
+  pull_request:
+    branches:
+      - android16
+  
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: 'Device defconfig to use'
+        required: true
+        default: 'chime-stock_defconfig'
+        type: choice
+        options:
+          - bengal_defconfig
+          - bengal-perf_defconfig
+          - bengal-lite_defconfig
+          - bengal-lite-perf_defconfig
+          - chime-stock_defconfig
+      
+      ksu_version:
+        description: 'ReSukiSU version/commit (leave empty for latest)'
+        required: false
+        default: ''
+        type: string
+      
+      enable_susfs:
+        description: 'Enable SUSFS features'
+        required: true
+        default: true
+        type: boolean
+      
+      susfs_spoof_uname:
+        description: 'Enable SUSFS uname spoofing'
+        required: false
+        default: true
+        type: boolean
+      
+      susfs_hide_kernelsu:
+        description: 'Hide KernelSU/SUSFS symbols from detection'
+        required: false
+        default: true
+        type: boolean
+      
+      enable_debug:
+        description: 'Enable KSU debug mode'
+        required: true
+        default: false
+        type: boolean
+      
+      build_variant:
+        description: 'Build variant'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+env:
+  KERNEL_NAME: Valeryn-KSU
+  KERNEL_VERSION: "4.19"
+  ARCH: arm64
+  SUBARCH: arm64
+
+concurrency:
+  group: kernel-build-${{ github.ref }}-${{ inputs.device_config || 'bengal_defconfig' }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare Build Environment
+    runs-on: ubuntu-22.04
+    outputs:
+      kernel_major: ${{ steps.kernel-info.outputs.kernel_major }}
+      kernel_full: ${{ steps.kernel-info.outputs.kernel_full }}
+      device_config: ${{ steps.config.outputs.device_config }}
+      build_type: ${{ steps.config.outputs.build_type }}
+      susfs_branch: ${{ steps.config.outputs.susfs_branch }}
+    
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      
+      - name: Get kernel version info
+        id: kernel-info
+        run: |
+          KERNEL_VERSION=$(grep "^VERSION" Makefile | awk '{print $3}')
+          KERNEL_PATCHLEVEL=$(grep "^PATCHLEVEL" Makefile | awk '{print $3}')
+          KERNEL_SUBLEVEL=$(grep "^SUBLEVEL" Makefile | awk '{print $3}')
+          
+          KERNEL_MAJOR="${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}"
+          KERNEL_FULL="${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}"
+          
+          echo "kernel_major=$KERNEL_MAJOR" >> $GITHUB_OUTPUT
+          echo "kernel_full=$KERNEL_FULL" >> $GITHUB_OUTPUT
+          
+          echo "=== Kernel Version ==="
+          echo "Major: $KERNEL_MAJOR"
+          echo "Full: $KERNEL_FULL"
+      
+      - name: Determine build configuration
+        id: config
+        run: |
+          # Device config
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DEVICE_CONFIG="${{ inputs.device_config }}"
+          else
+            DEVICE_CONFIG="bengal_defconfig"
+          fi
+          
+          # Build type
+          if [ "${{ inputs.build_variant }}" = "debug" ] || [ "${{ inputs.enable_debug }}" = "true" ]; then
+            BUILD_TYPE="debug"
+          else
+            BUILD_TYPE="release"
+          fi
+          
+          # SUSFS branch based on kernel version
+          KERNEL_MAJOR="${{ steps.kernel-info.outputs.kernel_major }}"
+          case "$KERNEL_MAJOR" in
+            "4.9")  SUSFS_BRANCH="kernel-4.9" ;;
+            "4.14") SUSFS_BRANCH="kernel-4.14" ;;
+            "4.19") SUSFS_BRANCH="kernel-4.19" ;;
+            "5.4")  SUSFS_BRANCH="kernel-5.4" ;;
+            "5.10") SUSFS_BRANCH="kernel-5.10" ;;
+            "5.15") SUSFS_BRANCH="kernel-5.15" ;;
+            "6.1")  SUSFS_BRANCH="kernel-6.1" ;;
+            *)      SUSFS_BRANCH="kernel-4.19" ;;
+          esac
+          
+          echo "device_config=$DEVICE_CONFIG" >> $GITHUB_OUTPUT
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "susfs_branch=$SUSFS_BRANCH" >> $GITHUB_OUTPUT
+          
+          echo "=== Build Configuration ==="
+          echo "Device Config: $DEVICE_CONFIG"
+          echo "Build Type: $BUILD_TYPE"
+          echo "SUSFS Branch: $SUSFS_BRANCH"
+
+  build:
+    name: Build Kernel
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      
+      - name: Set up environment variables
+        run: |
+          echo "DEVICE_CONFIG=${{ needs.prepare.outputs.device_config }}" >> $GITHUB_ENV
+          echo "BUILD_TYPE=${{ needs.prepare.outputs.build_type }}" >> $GITHUB_ENV
+          echo "KERNEL_MAJOR=${{ needs.prepare.outputs.kernel_major }}" >> $GITHUB_ENV
+          echo "KERNEL_FULL_VERSION=${{ needs.prepare.outputs.kernel_full }}" >> $GITHUB_ENV
+          echo "SUSFS_BRANCH=${{ needs.prepare.outputs.susfs_branch }}" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> $GITHUB_ENV
+      
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/clang
+          key: clang-proton-${{ runner.os }}
+          restore-keys: |
+            clang-proton-
+      
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            device-tree-compiler \
+            python3 \
+            zip \
+            unzip \
+            cpio \
+            openssl \
+            git \
+            patch \
+            ccache
+          
+          echo "Dependencies installed successfully"
+      
+      - name: Set up Clang toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          echo "=== Setting up Clang toolchain ==="
+          
+          mkdir -p $HOME/toolchains
+          
+          # Clone Proton Clang (works well with 4.19 kernels)
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/toolchains/clang
+          
+          echo "Clang toolchain downloaded"
+          ls -la $HOME/toolchains/clang/bin/ | head -20
+      
+      - name: Verify Clang toolchain
+        run: |
+          echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          
+          echo "=== Clang version ==="
+          $HOME/toolchains/clang/bin/clang --version
+          
+          # Set up ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          ccache -M 2G
+      
+      - name: Clone SUSFS
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Cloning SUSFS ==="
+          echo "Branch: ${{ env.SUSFS_BRANCH }}"
+          
+          # Clone SUSFS repository with the correct branch
+          git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
+            echo "WARNING: Failed to clone branch ${{ env.SUSFS_BRANCH }}, trying master..."
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          }
+          
+          cd susfs
+          echo "SUSFS commit:"
+          git log -1 --oneline
+          SUSFS_COMMIT=$(git rev-parse --short HEAD)
+          echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> $GITHUB_ENV
+          cd ..
+          
+          # List available files for debugging
+          echo "=== SUSFS directory structure ==="
+          find susfs -type f \( -name "*.c" -o -name "*.h" -o -name "*.patch" -o -name "Kconfig" \) | head -50
+      
+      - name: Clone and integrate ReSukiSU
+        run: |
+          echo "=== Integrating ReSukiSU ==="
+          
+          # Clone ReSukiSU
+          if [ -n "${{ inputs.ksu_version }}" ]; then
+            echo "Cloning ReSukiSU at version: ${{ inputs.ksu_version }}"
+            git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU KernelSU
+            cd KernelSU
+            git fetch --depth=1 origin ${{ inputs.ksu_version }} || true
+            git checkout ${{ inputs.ksu_version }} 2>/dev/null || echo "Using default branch"
+            cd ..
+          else
+            echo "Cloning latest ReSukiSU..."
+            git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU KernelSU
+          fi
+          
+          cd KernelSU
+          echo "ReSukiSU version info:"
+          git log -1 --oneline
+          KSU_COMMIT=$(git rev-parse --short HEAD)
+          echo "KSU_COMMIT=$KSU_COMMIT" >> $GITHUB_ENV
+          cd ..
+          
+          # Determine drivers directory
+          if [ -d "common/drivers" ]; then
+            DRIVER_DIR="common/drivers"
+          elif [ -d "drivers" ]; then
+            DRIVER_DIR="drivers"
+          else
+            echo "ERROR: drivers/ directory not found"
+            exit 1
+          fi
+          
+          echo "DRIVER_DIR=$DRIVER_DIR" >> $GITHUB_ENV
+          echo "Using drivers directory: $DRIVER_DIR"
+          
+          # Create symlink to KernelSU kernel module
+          KERNELSU_KERNEL_PATH="$(pwd)/KernelSU/kernel"
+          rm -f "$DRIVER_DIR/kernelsu"
+          ln -sf "$KERNELSU_KERNEL_PATH" "$DRIVER_DIR/kernelsu"
+          echo "Created symlink: $DRIVER_DIR/kernelsu -> $KERNELSU_KERNEL_PATH"
+          
+          # Verify symlink
+          ls -la "$DRIVER_DIR/kernelsu"
+          
+          # Add kernelsu to drivers Makefile
+          if ! grep -q "kernelsu" "$DRIVER_DIR/Makefile"; then
+            echo "" >> "$DRIVER_DIR/Makefile"
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$DRIVER_DIR/Makefile"
+            echo "Added kernelsu to $DRIVER_DIR/Makefile"
+          fi
+          
+          # Add kernelsu Kconfig to drivers Kconfig
+          if ! grep -q "kernelsu/Kconfig" "$DRIVER_DIR/Kconfig"; then
+            echo "Adding kernelsu Kconfig to $DRIVER_DIR/Kconfig..."
+            
+            # Backup original
+            cp "$DRIVER_DIR/Kconfig" "$DRIVER_DIR/Kconfig.backup"
+            
+            # Insert before endmenu or append
+            if grep -q "^endmenu" "$DRIVER_DIR/Kconfig"; then
+              sed -i "/^endmenu/i source \"$DRIVER_DIR/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
+            else
+              echo '' >> "$DRIVER_DIR/Kconfig"
+              echo "source \"$DRIVER_DIR/kernelsu/Kconfig\"" >> "$DRIVER_DIR/Kconfig"
+            fi
+            
+            # Verify it was added
+            if grep -q "kernelsu/Kconfig" "$DRIVER_DIR/Kconfig"; then
+              echo "Successfully added kernelsu Kconfig"
+            else
+              echo "ERROR: Failed to add kernelsu Kconfig, restoring backup"
+              cp "$DRIVER_DIR/Kconfig.backup" "$DRIVER_DIR/Kconfig"
+              exit 1
+            fi
+          fi
+          
+          echo "=== ReSukiSU integration complete ==="
+      
+      - name: Integrate SUSFS with KernelSU
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Integrating SUSFS with KernelSU ==="
+          
+          DRIVER_DIR="${{ env.DRIVER_DIR }}"
+          KERNELSU_DIR="$DRIVER_DIR/kernelsu"
+          
+          # Check if KernelSU directory exists (might be a symlink)
+          if [ -L "$KERNELSU_DIR" ]; then
+            REAL_KS_PATH=$(readlink -f "$KERNELSU_DIR")
+            echo "KernelSU is symlinked to: $REAL_KS_PATH"
+          fi
+          
+          # SUSFS kernel patches directory
+          PATCH_DIR="susfs/kernel_patches"
+          
+          # Step 1: Apply kernel patches if available
+          if [ -d "$PATCH_DIR" ]; then
+            echo "=== Applying SUSFS kernel patches ==="
+            
+            apply_patch() {
+              local patch_file="$1"
+              local patch_name=$(basename "$patch_file")
+              
+              echo "Trying patch: $patch_name"
+              
+              # Try different patch levels
+              for level in 1 0 2; do
+                if patch -p${level} --dry-run < "$patch_file" 2>/dev/null; then
+                  patch -p${level} < "$patch_file"
+                  echo "  ✓ Applied with patch -p${level}"
+                  return 0
+                fi
+              done
+              
+              # Try git apply
+              if git apply --check "$patch_file" 2>/dev/null; then
+                git apply "$patch_file"
+                echo "  ✓ Applied with git apply"
+                return 0
+              fi
+              
+              echo "  ✗ Could not apply: $patch_name"
+              return 1
+            }
+            
+            PATCHES_APPLIED=0
+            PATCHES_FAILED=0
+            
+            for patch_file in "$PATCH_DIR"/*.patch "$PATCH_DIR"/*.diff; do
+              if [ -f "$patch_file" ]; then
+                if apply_patch "$patch_file"; then
+                  PATCHES_APPLIED=$((PATCHES_APPLIED + 1))
+                else
+                  PATCHES_FAILED=$((PATCHES_FAILED + 1))
+                fi
+              fi
+            done
+            
+            echo "Patches applied: $PATCHES_APPLIED, failed: $PATCHES_FAILED"
+          else
+            echo "No kernel_patches directory, will integrate manually"
+          fi
+          
+          # Step 2: Copy SUSFS header to kernel include
+          echo "=== Copying SUSFS header files ==="
+          if [ -f "susfs/include/linux/susfs.h" ]; then
+            mkdir -p include/linux
+            cp susfs/include/linux/susfs.h include/linux/susfs.h
+            echo "Copied susfs.h to include/linux/"
+          elif [ -f "susfs/susfs.h" ]; then
+            mkdir -p include/linux
+            cp susfs/susfs.h include/linux/susfs.h
+            echo "Copied susfs.h to include/linux/"
+          fi
+          
+          # Step 3: Integrate SUSFS into KernelSU kernel module
+          echo "=== Integrating SUSFS into KernelSU module ==="
+          
+          # Find KernelSU kernel source directory
+          KSU_KERNEL_SRC=""
+          if [ -L "$KERNELSU_DIR" ]; then
+            KSU_KERNEL_SRC=$(readlink -f "$KERNELSU_DIR")
+          elif [ -d "$KERNELSU_DIR" ]; then
+            KSU_KERNEL_SRC="$KERNELSU_DIR"
+          fi
+          
+          if [ -z "$KSU_KERNEL_SRC" ] || [ ! -d "$KSU_KERNEL_SRC" ]; then
+            echo "ERROR: Could not find KernelSU kernel source"
+            exit 1
+          fi
+          
+          echo "KernelSU kernel source: $KSU_KERNEL_SRC"
+          ls -la "$KSU_KERNEL_SRC"
+          
+          # Look for SUSFS integration files
+          SUSFS_KERNEL_DIR=""
+          for dir in "susfs/kernel" "susfs/ksu" "susfs"; do
+            if [ -d "$dir" ] && [ -f "$dir/susfs.c" ]; then
+              SUSFS_KERNEL_DIR="$dir"
+              break
+            fi
+          done
+          
+          if [ -n "$SUSFS_KERNEL_DIR" ]; then
+            echo "Found SUSFS kernel files in: $SUSFS_KERNEL_DIR"
+            ls -la "$SUSFS_KERNEL_DIR"
+            
+            # Copy SUSFS source files to KernelSU
+            for file in susfs.c susfs.h sus_magic_mask.h; do
+              if [ -f "$SUSFS_KERNEL_DIR/$file" ]; then
+                cp "$SUSFS_KERNEL_DIR/$file" "$KSU_KERNEL_SRC/"
+                echo "Copied $file to KernelSU"
+              fi
+            done
+            
+            # Check for include directory files
+            if [ -d "$SUSFS_KERNEL_DIR/include" ]; then
+              mkdir -p "$KSU_KERNEL_SRC/include"
+              cp -r "$SUSFS_KERNEL_DIR/include/"* "$KSU_KERNEL_SRC/include/" 2>/dev/null || true
+            fi
+          else
+            echo "No SUSFS kernel source files found in expected locations"
+            echo "Searching for susfs.c..."
+            find susfs -name "susfs.c" -o -name "susfs.h" 2>/dev/null
+          fi
+          
+          # Step 4: Add SUSFS to KernelSU Makefile
+          echo "=== Updating KernelSU Makefile for SUSFS ==="
+          KSU_MAKEFILE="$KSU_KERNEL_SRC/Makefile"
+          
+          if [ -f "$KSU_MAKEFILE" ]; then
+            # Check if susfs is already in Makefile
+            if ! grep -q "susfs" "$KSU_MAKEFILE"; then
+              # Add susfs.o to object list
+              if grep -q "kernelsu-objs\|ksu-objs\|obj-" "$KSU_MAKEFILE"; then
+                # Add to existing object list
+                sed -i 's/\(kernelsu-objs\s*:=\|ksu-objs\s*:=\)/\1 susfs.o/' "$KSU_MAKEFILE" 2>/dev/null || \
+                sed -i 's/\(obj-\$.*\)+=.*/&\n& susfs.o/' "$KSU_MAKEFILE" 2>/dev/null || \
+                echo "kernelsu-y += susfs.o" >> "$KSU_MAKEFILE"
+                echo "Added susfs.o to KernelSU Makefile"
+              else
+                # Add new object definition
+                echo "" >> "$KSU_MAKEFILE"
+                echo "# SUSFS support" >> "$KSU_MAKEFILE"
+                echo "kernelsu-y += susfs.o" >> "$KSU_MAKEFILE"
+                echo "Added SUSFS to KernelSU Makefile"
+              fi
+            fi
+            
+            echo "KernelSU Makefile contents:"
+            cat "$KSU_MAKEFILE"
+          fi
+          
+          # Step 5: Create or update SUSFS Kconfig in KernelSU
+          echo "=== Updating KernelSU Kconfig for SUSFS ==="
+          KSU_KCONFIG="$KSU_KERNEL_SRC/Kconfig"
+          
+          if [ -f "$KSU_KCONFIG" ]; then
+            # Check if SUSFS config already exists
+            if ! grep -q "KSU_SUSFS" "$KSU_KCONFIG"; then
+              echo "" >> "$KSU_KCONFIG"
+              echo "# SUSFS Configuration" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	bool \"Enable SUSFS support\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU" >> "$KSU_KCONFIG"
+              echo "	default y" >> "$KSU_KCONFIG"
+              echo "	help" >> "$KSU_KCONFIG"
+              echo "	  Enable SUSFS (SUS File System) support for better hiding." >> "$KSU_KCONFIG"
+              echo "" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS_SUS_MOUNT" >> "$KSU_KCONFIG"
+              echo "	bool \"SUSFS mount hiding\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	default y" >> "$KSU_KCONFIG"
+              echo "" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS_SPOOF_UNAME" >> "$KSU_KCONFIG"
+              echo "	bool \"SUSFS uname spoofing\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	default y" >> "$KSU_KCONFIG"
+              echo "" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS_ENABLE_LOG" >> "$KSU_KCONFIG"
+              echo "	bool \"Enable SUSFS logging\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	default n" >> "$KSU_KCONFIG"
+              echo "" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS" >> "$KSU_KCONFIG"
+              echo "	bool \"Hide SUSFS symbols\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	default y" >> "$KSU_KCONFIG"
+              echo "" >> "$KSU_KCONFIG"
+              echo "config KSU_SUSFS_SUS_MAP" >> "$KSU_KCONFIG"
+              echo "	bool \"SUSFS map hiding\"" >> "$KSU_KCONFIG"
+              echo "	depends on KSU_SUSFS" >> "$KSU_KCONFIG"
+              echo "	default y" >> "$KSU_KCONFIG"
+              echo "Added SUSFS config options to KernelSU Kconfig"
+            fi
+          fi
+          
+          echo "=== SUSFS integration complete ==="
+      
+      - name: Configure kernel
+        run: |
+          echo "=== Configuring kernel ==="
+          
+          # Clean previous build
+          make mrproper || true
+          
+          # Create output directory
+          mkdir -p out
+          
+          # Apply base defconfig
+          echo "Applying defconfig: ${{ env.DEVICE_CONFIG }}"
+          make O=out ARCH=arm64 ${{ env.DEVICE_CONFIG }} \
+            CC=$HOME/toolchains/clang/bin/clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC=$HOME/toolchains/clang/bin/clang
+          
+          if [ ! -f "out/.config" ]; then
+            echo "ERROR: Failed to create .config"
+            exit 1
+          fi
+          
+          echo "=== Enabling KSU and required kernel options ==="
+          
+          # Enable core KSU option
+          ./scripts/config --file out/.config --enable KSU 2>/dev/null || \
+          echo "CONFIG_KSU=y" >> out/.config
+          
+          # Enable required kernel options for KernelSU
+          ./scripts/config --file out/.config --enable KPROBES 2>/dev/null || echo "CONFIG_KPROBES=y" >> out/.config
+          ./scripts/config --file out/.config --enable KALLSYMS 2>/dev/null || echo "CONFIG_KALLSYMS=y" >> out/.config
+          ./scripts/config --file out/.config --enable KALLSYMS_ALL 2>/dev/null || echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
+          
+          # Enable options required for proper kernel module support
+          ./scripts/config --file out/.config --enable MODULES 2>/dev/null || true
+          ./scripts/config --file out/.config --enable BINFMT_ELF 2>/dev/null || true
+          
+          # THREAD_INFO_IN_TASK is required for SUSFS on some kernels
+          if grep -q "CONFIG_THREAD_INFO_IN_TASK" out/.config; then
+            ./scripts/config --file out/.config --enable THREAD_INFO_IN_TASK 2>/dev/null || true
+            echo "Enabled THREAD_INFO_IN_TASK"
+          fi
+          
+          # Enable SUSFS options if requested
+          if [ "${{ inputs.enable_susfs }}" != "false" ]; then
+            echo "=== Enabling SUSFS options ==="
+            
+            # Core SUSFS option
+            ./scripts/config --file out/.config --enable KSU_SUSFS 2>/dev/null || \
+            echo "CONFIG_KSU_SUSFS=y" >> out/.config
+            
+            # SUSFS sub-features
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT 2>/dev/null || \
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config
+            
+            if [ "${{ inputs.susfs_spoof_uname }}" = "true" ] || [ -z "${{ inputs.susfs_spoof_uname }}" ]; then
+              ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME 2>/dev/null || \
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+            fi
+            
+            if [ "${{ inputs.susfs_hide_kernelsu }}" = "true" ] || [ -z "${{ inputs.susfs_hide_kernelsu }}" ]; then
+              ./scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 2>/dev/null || \
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
+            fi
+            
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP 2>/dev/null || \
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> out/.config
+            
+            # Optional logging (disabled by default for security)
+            if [ "${{ inputs.enable_debug }}" = "true" ]; then
+              ./scripts/config --file out/.config --enable KSU_SUSFS_ENABLE_LOG 2>/dev/null || \
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config
+            fi
+          fi
+          
+          # Enable debug options if requested
+          if [ "${{ inputs.enable_debug }}" = "true" ]; then
+            ./scripts/config --file out/.config --enable KSU_DEBUG 2>/dev/null || \
+            echo "CONFIG_KSU_DEBUG=y" >> out/.config
+            ./scripts/config --file out/.config --enable DEBUG_INFO 2>/dev/null || true
+          fi
+          
+          # Update config - resolve dependencies
+          echo "Running olddefconfig..."
+          make O=out ARCH=arm64 olddefconfig \
+            CC=$HOME/toolchains/clang/bin/clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC=$HOME/toolchains/clang/bin/clang
+          
+          # Verify configuration
+          echo "=== Verifying kernel config ==="
+          echo "--- KSU Options ---"
+          grep -E "CONFIG_KSU" out/.config || echo "WARNING: No KSU config found!"
+          echo "--- Required Options ---"
+          grep -E "CONFIG_KPROBES|CONFIG_KALLSYMS|CONFIG_THREAD_INFO_IN_TASK" out/.config || true
+          
+          if [ "${{ inputs.enable_susfs }}" != "false" ]; then
+            echo "--- SUSFS Options ---"
+            grep -E "CONFIG_KSU_SUSFS" out/.config || echo "WARNING: No SUSFS config found!"
+          fi
+          
+          echo "Kernel configuration complete"
+      
+      - name: Verify SUSFS integration
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Verifying SUSFS Integration ==="
+          
+          DRIVER_DIR="${{ env.DRIVER_DIR }}"
+          KSU_KERNEL_SRC=""
+          
+          if [ -L "$DRIVER_DIR/kernelsu" ]; then
+            KSU_KERNEL_SRC=$(readlink -f "$DRIVER_DIR/kernelsu")
+          fi
+          
+          ERRORS=0
+          
+          # Check for susfs.h in kernel includes
+          if [ -f "include/linux/susfs.h" ]; then
+            echo "✓ susfs.h found in include/linux/"
+          else
+            echo "✗ susfs.h NOT found in include/linux/"
+            ERRORS=$((ERRORS + 1))
+          fi
+          
+          # Check for SUSFS in KernelSU
+          if [ -n "$KSU_KERNEL_SRC" ] && [ -f "$KSU_KERNEL_SRC/susfs.c" ]; then
+            echo "✓ susfs.c found in KernelSU"
+          else
+            echo "✗ susfs.c NOT found in KernelSU"
+            ERRORS=$((ERRORS + 1))
+          fi
+          
+          # Check SUSFS config
+          if grep -q "CONFIG_KSU_SUSFS=y" out/.config; then
+            echo "✓ KSU_SUSFS enabled in kernel config"
+          else
+            echo "✗ KSU_SUSFS NOT enabled in kernel config"
+            ERRORS=$((ERRORS + 1))
+          fi
+          
+          if [ $ERRORS -gt 0 ]; then
+            echo ""
+            echo "WARNING: $ERRORS SUSFS integration issues detected"
+            echo "SUSFS may not work correctly. Continuing build anyway..."
+          else
+            echo ""
+            echo "All SUSFS checks passed!"
+          fi
+      
+      - name: Build kernel
+        run: |
+          echo "=== Building kernel ==="
+          
+          JOBS=$(nproc --all)
+          echo "Building with $JOBS jobs"
+          
+          # Build kernel with detailed logging
+          make -j$JOBS O=out ARCH=arm64 \
+            CC="$HOME/toolchains/clang/bin/clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC="$HOME/toolchains/clang/bin/clang" \
+            HOSTLD="$HOME/toolchains/clang/bin/ld.lld" \
+            2>&1 | tee build.log
+          
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+          echo "Build exit code: $BUILD_EXIT_CODE"
+          
+          # Check if build was successful
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "ERROR: Kernel Image not found!"
+            echo "=== Last 200 lines of build log ==="
+            tail -200 build.log
+            echo "=== Checking for SUSFS/KernelSU errors ==="
+            grep -i "susfs\|kernelsu\|error:" build.log | tail -50
+            exit 1
+          fi
+          
+          # Copy kernel images
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "Found Image.gz-dtb"
+            cp out/arch/arm64/boot/Image.gz-dtb ${{ env.KERNEL_NAME }}-Image.gz-dtb
+          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "Found Image.gz"
+            cp out/arch/arm64/boot/Image.gz ${{ env.KERNEL_NAME }}-Image.gz
+          fi
+          
+          cp out/arch/arm64/boot/Image ${{ env.KERNEL_NAME }}-Image
+          
+          echo "=== Build artifacts ==="
+          ls -la ${{ env.KERNEL_NAME }}-*
+          
+          # Show KSU/SUSFS symbols in kernel (if available)
+          echo "=== Checking for KSU/SUSFS symbols ==="
+          if [ -f "out/System.map" ]; then
+            grep -i "ksu\|susfs" out/System.map | head -20 || echo "No KSU/SUSFS symbols found in System.map"
+          elif [ -f "out/Module.symvers" ]; then
+            grep -i "ksu\|susfs" out/Module.symvers | head -20 || echo "No KSU/SUSFS symbols in Module.symvers"
+          fi
+          
+          echo "Build completed successfully"
+      
+      - name: Package kernel
+        run: |
+          echo "=== Packaging kernel ==="
+          
+          mkdir -p output
+          
+          # Copy kernel images
+          cp ${{ env.KERNEL_NAME }}-Image output/
+          [ -f "${{ env.KERNEL_NAME }}-Image.gz" ] && cp ${{ env.KERNEL_NAME }}-Image.gz output/
+          [ -f "${{ env.KERNEL_NAME }}-Image.gz-dtb" ] && cp ${{ env.KERNEL_NAME }}-Image.gz-dtb output/
+          
+          # Copy modules if available
+          [ -d "out/modules" ] && cp -r out/modules output/
+          
+          # Generate version info
+          cat > output/version.txt << EOF
+          Kernel: ${{ env.KERNEL_NAME }}
+          Version: ${{ env.KERNEL_FULL_VERSION }}
+          Device Config: ${{ env.DEVICE_CONFIG }}
+          Build Date: ${{ env.BUILD_DATE }}
+          Build Type: ${{ env.BUILD_TYPE }}
+          ReSukiSU Commit: ${{ env.KSU_COMMIT }}
+          SUSFS Commit: ${{ env.SUSFS_COMMIT }}
+          SUSFS Branch: ${{ env.SUSFS_BRANCH }}
+          SUSFS Enabled: ${{ inputs.enable_susfs || 'true' }}
+          SUSFS Uname Spoof: ${{ inputs.susfs_spoof_uname || 'true' }}
+          SUSFS Hide Symbols: ${{ inputs.susfs_hide_kernelsu || 'true' }}
+          GitHub Run: ${{ github.run_number }}
+          Source Commit: ${{ github.sha }}
+          EOF
+          
+          # Create zip
+          cd output
+          zip -r ../${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip *
+          cd ..
+          
+          # Calculate checksums
+          sha256sum ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip > ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          
+          echo "Package created: ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip"
+          ls -la ${{ env.KERNEL_NAME }}-*
+      
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}
+          path: |
+            output/
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          retention-days: 30
+      
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.BUILD_DATE }}
+          path: build.log
+          retention-days: 7
+      
+      - name: Upload kernel config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config-${{ env.BUILD_DATE }}
+          path: out/.config
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
