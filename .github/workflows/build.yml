@@ -31,7 +31,10 @@ jobs:
           git clone https://github.com/ReSukiSU/ReSukiSU.git drivers/kernelsu --depth=1
           
           # 3. Move files and update build system
-          mv drivers/kernelsu/kernel/* drivers/kernelsu/
+          # Check if kernel directory exists before moving
+          if [ -d "drivers/kernelsu/kernel" ]; then
+            mv drivers/kernelsu/kernel/* drivers/kernelsu/
+          fi
           echo "obj-y += kernelsu/" >> drivers/Makefile
           sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
@@ -48,8 +51,21 @@ jobs:
           #endif
           EOF
 
-          # 2. Inject this header into the ReSukiSU hooks file
-          sed -i '1i #include <linux/ksu_hooks.h>' drivers/kernelsu/hooks.c
+          # 2. Inject this header into ReSukiSU files
+          # NOTE: hooks.c might not exist in all forks. We inject into kpm.c and ksu.c to be safe.
+          if [ -f "drivers/kernelsu/hooks.c" ]; then
+            sed -i '1i #include <linux/ksu_hooks.h>' drivers/kernelsu/hooks.c
+          fi
+          
+          # Inject into kpm.c (Kernel Patch Module - likely where hooks are)
+          if [ -f "drivers/kernelsu/kpm.c" ]; then
+             sed -i '1i #include <linux/ksu_hooks.h>' drivers/kernelsu/kpm.c
+          fi
+
+          # Inject into ksu.c (Core logic)
+          if [ -f "drivers/kernelsu/ksu.c" ]; then
+             sed -i '1i #include <linux/ksu_hooks.h>' drivers/kernelsu/ksu.c
+          fi
           
           # 3. Define and Export variables in the core (Reset files first to prevent redefinition)
           git checkout -- fs/read_write.c fs/exec.c
@@ -58,10 +74,14 @@ jobs:
 
           # 4. Fix KPROBE_HIT_ACTIVE specifically for 4.19
           # We use 'sed' to insert it AFTER the includes in kpm.c
-          sed -i '/#include/a #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
+          if [ -f "drivers/kernelsu/kpm.c" ]; then
+            sed -i '/#include/a #ifndef KPROBE_HIT_ACTIVE\n#define KPROBE_HIT_ACTIVE 1\n#endif' drivers/kernelsu/kpm.c
+          fi
 
           # 5. Fix Namespace error
-          sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
+          if [ -f "drivers/kernelsu/ksu.c" ]; then
+            sed -i '1i #include <linux/user_namespace.h>' drivers/kernelsu/ksu.c
+          fi
 
       - name: Build Kernel
         run: |
