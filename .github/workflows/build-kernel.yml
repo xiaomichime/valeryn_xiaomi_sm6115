@@ -1,0 +1,520 @@
+# GitHub Actions Workflow for building Xiaomi SM6115 Kernel with ReSukiSU
+# Repository: xiaomichime/valeryn_xiaomi_sm6115
+# ReSukiSU: https://github.com/ReSukiSU/ReSukiSU
+#
+# Usage:
+# 1. Copy this file to your kernel repository at .github/workflows/build-kernel.yml
+# 2. Customize the device config and options as needed
+# 3. Push to your repository and the workflow will trigger automatically
+
+name: Build Kernel with ReSukiSU
+
+on:
+  # Trigger on push to specific branches
+  push:
+    branches:
+      - android16
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  
+  # Trigger on pull requests
+  pull_request:
+    branches:
+      - android16
+  
+  # Allow manual trigger with customizable options
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: 'Device defconfig to use (e.g., bengal_defconfig, chime-stock_defconfig)'
+        required: true
+        default: 'bengal_defconfig'
+        type: choice
+        options:
+          - bengal_defconfig
+          - bengal-perf_defconfig
+          - bengal-lite_defconfig
+          - bengal-lite-perf_defconfig
+          - chime-stock_defconfig
+      
+      ksu_version:
+        description: 'ReSukiSU version/commit (leave empty for latest main)'
+        required: false
+        default: ''
+        type: string
+      
+      enable_susfs:
+        description: 'Enable SUSFS features'
+        required: true
+        default: true
+        type: boolean
+      
+      enable_debug:
+        description: 'Enable KSU debug mode'
+        required: true
+        default: false
+        type: boolean
+      
+      build_variant:
+        description: 'Build variant'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+  # Allow other workflows to call this
+  workflow_call:
+    inputs:
+      device_config:
+        description: 'Device defconfig to use'
+        required: true
+        type: string
+        default: 'bengal_defconfig'
+
+# Environment variables
+env:
+  KERNEL_NAME: Valeryn-KSU
+  KERNEL_VERSION: "4.19"
+  ARCH: arm64
+  SUBARCH: arm64
+  CLANG_VERSION: "r450784d"
+  GCC_VERSION: "aarch64-linux-android-4.9"
+
+# Concurrent builds control
+concurrency:
+  group: kernel-build-${{ github.ref }}-${{ inputs.device_config || 'bengal_defconfig' }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================
+  # Build Job
+  # ============================================
+  build:
+    name: Build Kernel (${{ inputs.device_config || 'bengal_defconfig' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    
+    steps:
+      # ----------------------------------------
+      # Step 1: Checkout kernel source
+      # ----------------------------------------
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      
+      # ----------------------------------------
+      # Step 2: Set up environment variables
+      # ----------------------------------------
+      - name: Set up environment
+        run: |
+          # Determine device config
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DEVICE_CONFIG=${{ inputs.device_config }}" >> $GITHUB_ENV
+          else
+            echo "DEVICE_CONFIG=bengal_defconfig" >> $GITHUB_ENV
+          fi
+          
+          # Set build variant
+          if [ "${{ inputs.build_variant }}" = "debug" ] || [ "${{ inputs.enable_debug }}" = "true" ]; then
+            echo "BUILD_TYPE=debug" >> $GITHUB_ENV
+          else
+            echo "BUILD_TYPE=release" >> $GITHUB_ENV
+          fi
+          
+          # Get kernel version from Makefile
+          KERNEL_VERSION=$(grep "^VERSION" Makefile | awk '{print $3}')
+          KERNEL_PATCHLEVEL=$(grep "^PATCHLEVEL" Makefile | awk '{print $3}')
+          KERNEL_SUBLEVEL=$(grep "^SUBLEVEL" Makefile | awk '{print $3}')
+          echo "KERNEL_FULL_VERSION=${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}" >> $GITHUB_ENV
+          
+          # Generate build timestamp
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> $GITHUB_ENV
+          
+          # Set KSU options
+          KSU_OPTS="CONFIG_KSU=y"
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            KSU_OPTS="$KSU_OPTS CONFIG_KSU_SUSFS=y"
+          fi
+          if [ "${{ inputs.enable_debug }}" = "true" ]; then
+            KSU_OPTS="$KSU_OPTS CONFIG_KSU_DEBUG=y"
+          fi
+          echo "KSU_OPTS=$KSU_OPTS" >> $GITHUB_ENV
+          
+          # Print environment info
+          echo "=== Build Environment ==="
+          echo "Kernel Version: ${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}"
+          echo "Device Config: ${{ env.DEVICE_CONFIG }}"
+          echo "Build Type: ${{ env.BUILD_TYPE }}"
+          echo "KSU Options: $KSU_OPTS"
+      
+      # ----------------------------------------
+      # Step 3: Set up toolchains
+      # ----------------------------------------
+      - name: Set up Clang toolchain
+        run: |
+          echo "=== Downloading Clang toolchain ==="
+          
+          # Create toolchain directory
+          mkdir -p $HOME/toolchains
+          
+          # Download prebuilt clang from Android AOSP
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${{ env.CLANG_VERSION }}.tar.gz"
+          
+          # Try alternative sources if AOSP is slow
+          if ! curl -fsSL "https://gitlab.com/LeCmnGamer/clang-toolchain/-/archive/main/clang-toolchain-main.tar.gz?path=clang-${{ env.CLANG_VERSION }}" -o clang.tar.gz 2>/dev/null; then
+            echo "Trying alternative clang source..."
+            # Use Google's clang mirror
+            wget -q "https://dl.google.com/android/repository/clang-${{ env.CLANG_VERSION }}-linux-x86.zip" -O clang.zip && unzip -q clang.zip -d $HOME/toolchains/clang || true
+          else
+            mkdir -p $HOME/toolchains/clang
+            tar -xzf clang.tar.gz -C $HOME/toolchains/clang
+          fi
+          
+          # Set up Proton Clang as fallback (better for older kernels)
+          if [ ! -d "$HOME/toolchains/clang/bin" ]; then
+            echo "Downloading Proton Clang..."
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/toolchains/clang
+          fi
+          
+          echo "Clang toolchain ready at: $HOME/toolchains/clang"
+          ls -la $HOME/toolchains/clang/bin/ | head -20
+          
+          # Export paths
+          echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+      
+      - name: Set up GCC toolchain (for cross-compilation)
+        run: |
+          echo "=== Downloading GCC toolchain ==="
+          
+          # Download aarch64 gcc
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 $HOME/toolchains/aarch64-gcc || \
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 $HOME/toolchains/aarch64-gcc
+          
+          # Download arm gcc (for 32-bit compat)
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 $HOME/toolchains/arm-gcc || \
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 $HOME/toolchains/arm-gcc
+          
+          echo "GCC toolchains ready"
+          echo "GCC_PATH=$HOME/toolchains/aarch64-gcc" >> $GITHUB_ENV
+          echo "ARM_GCC_PATH=$HOME/toolchains/arm-gcc" >> $GITHUB_ENV
+          echo "$HOME/toolchains/aarch64-gcc/bin" >> $GITHUB_PATH
+          echo "$HOME/toolchains/arm-gcc/bin" >> $GITHUB_PATH
+      
+      - name: Install build dependencies
+        run: |
+          echo "=== Installing build dependencies ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            ccache \
+            libelf-dev \
+            libssl-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            device-tree-compiler \
+            python3 \
+            python3-pip \
+            zip \
+            unzip \
+            jq \
+            wget \
+            curl \
+            cpio \
+            openssl
+          
+          # Install LLVM tools for kernel builds
+          sudo apt-get install -y -qq llvm lld || true
+          
+          echo "Dependencies installed successfully"
+      
+      # ----------------------------------------
+      # Step 4: Integrate ReSukiSU
+      # ----------------------------------------
+      - name: Clone and integrate ReSukiSU
+        run: |
+          echo "=== Integrating ReSukiSU ==="
+          
+          # Clone ReSukiSU repository
+          if [ -n "${{ inputs.ksu_version }}" ]; then
+            echo "Cloning ReSukiSU at version: ${{ inputs.ksu_version }}"
+            git clone --depth=1 --branch ${{ inputs.ksu_version }} https://github.com/ReSukiSU/ReSukiSU KernelSU || \
+            git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU KernelSU && cd KernelSU && git checkout ${{ inputs.ksu_version }}
+          else
+            echo "Cloning latest ReSukiSU..."
+            git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU KernelSU
+          fi
+          
+          cd KernelSU
+          echo "ReSukiSU version info:"
+          git log -1 --oneline
+          KSU_COMMIT=$(git rev-parse --short HEAD)
+          echo "KSU_COMMIT=$KSU_COMMIT" >> $GITHUB_ENV
+          cd ..
+          
+          # Determine drivers directory
+          if [ -d "common/drivers" ]; then
+            DRIVER_DIR="common/drivers"
+          elif [ -d "drivers" ]; then
+            DRIVER_DIR="drivers"
+          else
+            echo "ERROR: drivers/ directory not found"
+            exit 1
+          fi
+          
+          echo "Using drivers directory: $DRIVER_DIR"
+          
+          # Create symlink to KernelSU kernel module
+          ln -sf "$(realpath KernelSU/kernel)" "$DRIVER_DIR/kernelsu"
+          echo "Created symlink: $DRIVER_DIR/kernelsu -> KernelSU/kernel"
+          
+          # Add kernelsu to drivers Makefile if not present
+          if ! grep -q "kernelsu" "$DRIVER_DIR/Makefile"; then
+            echo "" >> "$DRIVER_DIR/Makefile"
+            echo "obj-\$(CONFIG_KSU) += kernelsu/" >> "$DRIVER_DIR/Makefile"
+            echo "Added kernelsu to $DRIVER_DIR/Makefile"
+          fi
+          
+          # Add kernelsu Kconfig to drivers Kconfig if not present
+          if ! grep -q "drivers/kernelsu/Kconfig" "$DRIVER_DIR/Kconfig"; then
+            sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
+            echo "Added kernelsu Kconfig to $DRIVER_DIR/Kconfig"
+          fi
+          
+          echo "=== ReSukiSU integration complete ==="
+      
+      # ----------------------------------------
+      # Step 5: Configure kernel
+      # ----------------------------------------
+      - name: Configure kernel with ReSukiSU
+        run: |
+          echo "=== Configuring kernel ==="
+          
+          # Set up cross-compile environment
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=$HOME/toolchains/aarch64-gcc/bin/aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=$HOME/toolchains/arm-gcc/bin/arm-linux-androideabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          
+          # Use clang for compilation
+          CC="$HOME/toolchains/clang/bin/clang"
+          
+          # Clean previous build
+          make mrproper || true
+          
+          # Apply base defconfig
+          make O=out ARCH=arm64 ${{ env.DEVICE_CONFIG }}
+          
+          # Enable ReSukiSU options
+          cat >> out/.config << 'EOF'
+          # ReSukiSU Configuration
+          CONFIG_KSU=y
+          EOF
+          
+          # Add SUSFS if enabled
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            cat >> out/.config << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+          
+          # Add debug options if enabled
+          if [ "${{ inputs.enable_debug }}" = "true" ]; then
+            cat >> out/.config << 'EOF'
+          CONFIG_KSU_DEBUG=y
+          EOF
+          fi
+          
+          # Ensure required options for KernelSU
+          ./scripts/config --file out/.config -e KPROBES
+          ./scripts/config --file out/.config -e KALLSYMS
+          ./scripts/config --file out/.config -e KALLSYMS_ALL
+          
+          # Update config
+          make O=out ARCH=arm64 olddefconfig
+          
+          # Verify KSU is enabled
+          echo "=== Verifying KSU config ==="
+          grep -E "CONFIG_KSU" out/.config || echo "WARNING: KSU config not found!"
+          
+          echo "Kernel configuration complete"
+      
+      # ----------------------------------------
+      # Step 6: Build kernel
+      # ----------------------------------------
+      - name: Build kernel
+        run: |
+          echo "=== Building kernel ==="
+          
+          # Set up build environment
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=$HOME/toolchains/aarch64-gcc/bin/aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=$HOME/toolchains/arm-gcc/bin/arm-linux-androideabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          
+          # Get number of CPU cores for parallel build
+          JOBS=$(nproc --all)
+          echo "Building with $JOBS jobs"
+          
+          # Build kernel
+          make -j$JOBS O=out ARCH=arm64 \
+            CC=$HOME/toolchains/clang/bin/clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=$HOME/toolchains/aarch64-gcc/bin/aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=$HOME/toolchains/arm-gcc/bin/arm-linux-androideabi- \
+            2>&1 | tee build.log
+          
+          echo "=== Build completed ==="
+          
+          # Check if build was successful
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "ERROR: Kernel Image not found!"
+            exit 1
+          fi
+          
+          # Check for Image.gz-dtb (device tree bundled)
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "Found Image.gz-dtb"
+            cp out/arch/arm64/boot/Image.gz-dtb ${{ env.KERNEL_NAME }}-Image.gz-dtb
+          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "Found Image.gz"
+            cp out/arch/arm64/boot/Image.gz ${{ env.KERNEL_NAME }}-Image.gz
+          fi
+          
+          # Copy Image
+          cp out/arch/arm64/boot/Image ${{ env.KERNEL_NAME }}-Image
+          
+          # List output files
+          ls -la ${{ env.KERNEL_NAME }}-*
+          
+          echo "Build artifacts ready"
+      
+      # ----------------------------------------
+      # Step 7: Package kernel
+      # ----------------------------------------
+      - name: Package kernel
+        run: |
+          echo "=== Packaging kernel ==="
+          
+          # Create output directory
+          mkdir -p output
+          
+          # Copy kernel images
+          cp ${{ env.KERNEL_NAME }}-Image output/
+          if [ -f "${{ env.KERNEL_NAME }}-Image.gz" ]; then
+            cp ${{ env.KERNEL_NAME }}-Image.gz output/
+          fi
+          if [ -f "${{ env.KERNEL_NAME }}-Image.gz-dtb" ]; then
+            cp ${{ env.KERNEL_NAME }}-Image.gz-dtb output/
+          fi
+          
+          # Copy kernel modules if built
+          if [ -d "out/modules" ]; then
+            cp -r out/modules output/
+          fi
+          
+          # Generate version info
+          cat > output/version.txt << EOF
+          Kernel: ${{ env.KERNEL_NAME }}
+          Version: ${{ env.KERNEL_FULL_VERSION }}
+          Device Config: ${{ env.DEVICE_CONFIG }}
+          Build Date: ${{ env.BUILD_DATE }}
+          Build Type: ${{ env.BUILD_TYPE }}
+          ReSukiSU Commit: ${{ env.KSU_COMMIT }}
+          SUSFS Enabled: ${{ inputs.enable_susfs || 'true' }}
+          GitHub Run: ${{ github.run_number }}
+          Commit: ${{ github.sha }}
+          EOF
+          
+          # Create zip package
+          cd output
+          zip -r ../${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip *
+          cd ..
+          
+          # Calculate checksums
+          sha256sum ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip > ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          
+          echo "Package created: ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip"
+          ls -la ${{ env.KERNEL_NAME }}-*
+      
+      # ----------------------------------------
+      # Step 8: Upload artifacts
+      # ----------------------------------------
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}
+          path: |
+            output/
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          retention-days: 30
+      
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.BUILD_DATE }}
+          path: build.log
+          retention-days: 7
+
+  # ============================================
+  # Release Job (only on tag push)
+  # ============================================
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================
+  # Notification Job (optional)
+  # ============================================
+  notify:
+    name: Notify on failure
+    needs: build
+    runs-on: ubuntu-22.04
+    if: failure()
+    
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "Build failed for ${{ github.repository }}"
+          echo "Check the workflow logs for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
