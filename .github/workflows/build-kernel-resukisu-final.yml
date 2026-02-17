@@ -69,6 +69,13 @@ jobs:
             echo "No SUSFS modifications found in menu.c - skipping fix"
           fi
 
+      - name: Fix TASKS_TRACE_RCU Kconfig
+        run: |
+          # Change def_bool 0 to def_bool y so CONFIG_TASKS_TRACE_RCU can be enabled
+          sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
+          echo "Fixed TASKS_TRACE_RCU in Kconfig:"
+          grep -A2 "config TASKS_TRACE_RCU" kernel/rcu/Kconfig
+
       - name: Configure kernel for Non-GKI
         run: |
           make ARCH=arm64 O=out chime-stock_defconfig
@@ -116,6 +123,9 @@ jobs:
 
           echo "=== BPF Status (should be disabled) ==="
           grep -E "CONFIG_BPF" out/.config || echo "BPF disabled"
+
+          echo "=== TASKS_TRACE_RCU Status (should be enabled) ==="
+          grep "CONFIG_TASKS_TRACE_RCU" out/.config
 
       - name: Build kernel
         run: |
