@@ -1,0 +1,548 @@
+#================================================================================
+# Xiaomi SM6115 Kernel Build Workflow with ReSukiSU + SUSFS
+#================================================================================
+# Repository: xiaomichime/valeryn_xiaomi_sm6115
+# Kernel: 4.19.113 (Non-GKI)
+# Device: Xiaomi SM6115 (chime/bengal)
+#================================================================================
+
+name: Build Kernel - ReSukiSU + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: 'Device defconfig'
+        required: true
+        default: 'chime-stock_defconfig'
+        type: choice
+        options:
+          - chime-stock_defconfig
+          - bengal_defconfig
+          - bengal-perf_defconfig
+          - bengal-lite_defconfig
+          - bengal-lite-perf_defconfig
+      
+      resukisu_version:
+        description: 'ReSukiSU version (tag/commit/branch, empty = latest)'
+        required: false
+        default: ''
+        type: string
+      
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: true
+        default: 'kernel-4.19'
+        type: choice
+        options:
+          - kernel-4.19
+          - kernel-5.4
+          - kernel-5.10
+          - kernel-5.15
+          - kernel-6.1
+          - master
+      
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: true
+        default: true
+        type: boolean
+      
+      enable_kpm:
+        description: 'Enable KPM (Kernel Patch Module)'
+        required: true
+        default: true
+        type: boolean
+      
+      susfs_hide_symbols:
+        description: 'Hide KSU/SUSFS symbols'
+        required: true
+        default: true
+        type: boolean
+      
+      susfs_spoof_uname:
+        description: 'Spoof uname'
+        required: true
+        default: true
+        type: boolean
+      
+      enable_debug:
+        description: 'Enable debug mode'
+        required: true
+        default: false
+        type: boolean
+      
+      build_ccache:
+        description: 'Enable ccache'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  KERNEL_NAME: Valeryn-ReSukiSU
+  ARCH: arm64
+  SUBARCH: arm64
+
+concurrency:
+  group: kernel-build-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare Build
+    runs-on: ubuntu-22.04
+    outputs:
+      kernel_version: ${{ steps.kernel-info.outputs.version }}
+      kernel_major: ${{ steps.kernel-info.outputs.major }}
+      device_config: ${{ steps.config.outputs.device_config }}
+      susfs_branch: ${{ steps.config.outputs.susfs_branch }}
+      build_date: ${{ steps.config.outputs.build_date }}
+    
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Extract kernel version
+        id: kernel-info
+        run: |
+          VERSION=$(grep "^VERSION" Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep "^PATCHLEVEL" Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep "^SUBLEVEL" Makefile | awk '{print $3}')
+          
+          MAJOR="${VERSION}.${PATCHLEVEL}"
+          FULL="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+          
+          echo "version=${FULL}" >> $GITHUB_OUTPUT
+          echo "major=${MAJOR}" >> $GITHUB_OUTPUT
+          
+          echo "=== Kernel Information ==="
+          echo "Kernel Version: ${FULL}"
+          echo "Kernel Major: ${MAJOR}"
+      
+      - name: Configure build parameters
+        id: config
+        run: |
+          CONFIG="${{ inputs.device_config }}"
+          SUSFS="${{ inputs.susfs_branch }}"
+          DATE=$(date +%Y%m%d-%H%M)
+          
+          echo "device_config=${CONFIG}" >> $GITHUB_OUTPUT
+          echo "susfs_branch=${SUSFS}" >> $GITHUB_OUTPUT
+          echo "build_date=${DATE}" >> $GITHUB_OUTPUT
+          
+          echo "=== Build Configuration ==="
+          echo "Device Config: ${CONFIG}"
+          echo "SUSFS Branch: ${SUSFS}"
+          echo "Build Date: ${DATE}"
+
+  build:
+    name: Build Kernel
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      
+      - name: Set environment variables
+        run: |
+          echo "DEVICE_CONFIG=${{ needs.prepare.outputs.device_config }}" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=${{ needs.prepare.outputs.kernel_version }}" >> $GITHUB_ENV
+          echo "KERNEL_MAJOR=${{ needs.prepare.outputs.kernel_major }}" >> $GITHUB_ENV
+          echo "SUSFS_BRANCH=${{ needs.prepare.outputs.susfs_branch }}" >> $GITHUB_ENV
+          echo "BUILD_DATE=${{ needs.prepare.outputs.build_date }}" >> $GITHUB_ENV
+          echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
+      
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bc bison flex \
+            libelf-dev libssl-dev \
+            libncurses5-dev libncursesw5-dev \
+            device-tree-compiler python3 \
+            zip unzip cpio openssl \
+            git patch ccache \
+            libdw-dev libbfd-dev \
+            binutils-dev
+      
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/clang
+          key: clang-proton-clang-12
+      
+      - name: Setup Clang toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/toolchains
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang ~/toolchains/clang
+      
+      - name: Configure toolchain
+        run: |
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          ccache -M 2G
+          
+          echo "=== Clang Version ==="
+          $HOME/toolchains/clang/bin/clang --version
+      
+      - name: Clone ReSukiSU
+        id: resukisu
+        run: |
+          echo "=== Cloning ReSukiSU ==="
+          
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          cd KernelSU
+          
+          if [ -n "${{ inputs.resukisu_version }}" ]; then
+            git fetch --depth=1 origin "${{ inputs.resukisu_version }}" || true
+            git checkout "${{ inputs.resukisu_version }}" 2>/dev/null || echo "Using default branch"
+          fi
+          
+          KSU_COMMIT=$(git rev-parse --short HEAD)
+          KSU_TAG=$(git describe --tags --always 2>/dev/null || echo "main")
+          
+          echo "ksu_commit=${KSU_COMMIT}" >> $GITHUB_OUTPUT
+          echo "ksu_tag=${KSU_TAG}" >> $GITHUB_OUTPUT
+          
+          echo "ReSukiSU Version: ${KSU_TAG}"
+          echo "ReSukiSU Commit: ${KSU_COMMIT}"
+      
+      - name: Clone SUSFS
+        id: susfs
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Cloning SUSFS ==="
+          echo "Branch: ${{ env.SUSFS_BRANCH }}"
+          
+          git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
+            echo "Branch not found, trying master..."
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          }
+          
+          cd susfs
+          SUSFS_COMMIT=$(git rev-parse --short HEAD)
+          echo "susfs_commit=${SUSFS_COMMIT}" >> $GITHUB_OUTPUT
+          echo "SUSFS Commit: ${SUSFS_COMMIT}"
+      
+      - name: Integrate ReSukiSU
+        run: |
+          echo "=== Integrating ReSukiSU ==="
+          
+          if [ -d "common/drivers" ]; then
+            DRIVER_DIR="common/drivers"
+          elif [ -d "drivers" ]; then
+            DRIVER_DIR="drivers"
+          else
+            echo "ERROR: drivers/ directory not found!"
+            exit 1
+          fi
+          
+          echo "DRIVER_DIR=${DRIVER_DIR}" >> $GITHUB_ENV
+          echo "Drivers directory: ${DRIVER_DIR}"
+          
+          rm -f "${DRIVER_DIR}/kernelsu"
+          ln -sf "$(pwd)/KernelSU/kernel" "${DRIVER_DIR}/kernelsu"
+          echo "Created symlink: ${DRIVER_DIR}/kernelsu -> KernelSU/kernel"
+          
+          if ! grep -q "kernelsu" "${DRIVER_DIR}/Makefile"; then
+            echo "" >> "${DRIVER_DIR}/Makefile"
+            echo "obj-\$(CONFIG_KSU) += kernelsu/" >> "${DRIVER_DIR}/Makefile"
+            echo "Added kernelsu to ${DRIVER_DIR}/Makefile"
+          fi
+          
+          if ! grep -q "kernelsu/Kconfig" "${DRIVER_DIR}/Kconfig"; then
+            if grep -q "^endmenu" "${DRIVER_DIR}/Kconfig"; then
+              sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' "${DRIVER_DIR}/Kconfig"
+            else
+              echo 'source "drivers/kernelsu/Kconfig"' >> "${DRIVER_DIR}/Kconfig"
+            fi
+            echo "Added kernelsu Kconfig"
+          fi
+      
+      - name: Prepare SUSFS kernel integration
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Copying SUSFS source files ==="
+          
+          mkdir -p include/linux
+          mkdir -p fs
+          
+          for header in susfs.h susfs_def.h sus_su.h; do
+            if [ -f "susfs/kernel_patches/include/linux/${header}" ]; then
+              cp "susfs/kernel_patches/include/linux/${header}" include/linux/
+              echo "Copied: ${header} -> include/linux/"
+            fi
+          done
+          
+          for source in susfs.c sus_su.c; do
+            if [ -f "susfs/kernel_patches/fs/${source}" ]; then
+              cp "susfs/kernel_patches/fs/${source}" fs/
+              echo "Copied: ${source} -> fs/"
+            fi
+          done
+          
+          echo ""
+          echo "SUSFS files in kernel:"
+          ls -la include/linux/sus*.h 2>/dev/null || echo "WARNING: No SUSFS headers!"
+          ls -la fs/sus*.c 2>/dev/null || echo "WARNING: No SUSFS sources!"
+      
+      - name: Apply SUSFS kernel patches
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Applying SUSFS patches ==="
+          
+          PATCH_DIR="susfs/kernel_patches"
+          PATCHES_OK=0
+          PATCHES_FAIL=0
+          
+          KERNEL_PATCH="${PATCH_DIR}/50_add_susfs_in_kernel-${{ env.KERNEL_MAJOR }}.patch"
+          
+          if [ -f "$KERNEL_PATCH" ]; then
+            echo "Applying: ${KERNEL_PATCH}"
+            for level in 1 0 2; do
+              if patch -p${level} --dry-run < "$KERNEL_PATCH" 2>/dev/null; then
+                patch -p${level} < "$KERNEL_PATCH"
+                echo "Applied with patch -p${level}"
+                PATCHES_OK=$((PATCHES_OK + 1))
+                break
+              fi
+            done || PATCHES_FAIL=$((PATCHES_FAIL + 1))
+          else
+            echo "Kernel patch not found: ${KERNEL_PATCH}"
+          fi
+          
+          echo ""
+          echo "Patches applied: ${PATCHES_OK}"
+          echo "Patches failed: ${PATCHES_FAIL}"
+      
+      - name: Configure SUSFS in fs/
+        if: ${{ inputs.enable_susfs != false }}
+        run: |
+          echo "=== Configuring SUSFS in fs/ ==="
+          
+          if ! grep -q "CONFIG_KSU_SUSFS" fs/Makefile; then
+            cat >> fs/Makefile << 'EOF'
+
+# SUSFS support
+obj-$(CONFIG_KSU_SUSFS) += susfs.o
+EOF
+            echo "Added SUSFS to fs/Makefile"
+          fi
+          
+          if ! grep -q "config KSU_SUSFS" fs/Kconfig; then
+            cat >> fs/Kconfig << 'EOF'
+
+# SUSFS Configuration
+config KSU_SUSFS
+    bool "Enable SUSFS support for KernelSU"
+    depends on KSU
+    depends on THREAD_INFO_IN_TASK
+    default y
+
+config KSU_SUSFS_SUS_MOUNT
+    bool "SUSFS mount hiding"
+    depends on KSU_SUSFS
+    default y
+
+config KSU_SUSFS_SUS_PATH
+    bool "SUSFS path hiding"
+    depends on KSU_SUSFS
+    default y
+
+config KSU_SUSFS_SUS_MAP
+    bool "SUSFS map hiding"
+    depends on KSU_SUSFS
+    default y
+
+config KSU_SUSFS_SPOOF_UNAME
+    bool "SUSFS uname spoofing"
+    depends on KSU_SUSFS
+    default y
+
+config KSU_SUSFS_ENABLE_LOG
+    bool "SUSFS logging"
+    depends on KSU_SUSFS
+    default n
+
+config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+    bool "Hide SUSFS symbols"
+    depends on KSU_SUSFS
+    default y
+
+config KSU_SUSFS_OPEN_REDIRECT
+    bool "SUSFS open redirect"
+    depends on KSU_SUSFS
+    default y
+EOF
+            echo "Added SUSFS to fs/Kconfig"
+          fi
+      
+      - name: Configure kernel
+        run: |
+          echo "=== Configuring kernel ==="
+          
+          make mrproper || true
+          mkdir -p out
+          
+          make O=out ARCH=arm64 ${{ env.DEVICE_CONFIG }} \
+            CC="$HOME/toolchains/clang/bin/clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC="$HOME/toolchains/clang/bin/clang"
+          
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --enable KALLSYMS
+          ./scripts/config --file out/.config --enable KALLSYMS_ALL
+          ./scripts/config --file out/.config --enable KPROBES
+          ./scripts/config --file out/.config --enable THREAD_INFO_IN_TASK
+          ./scripts/config --file out/.config --enable KPM
+          
+          if [ "${{ inputs.enable_susfs }}" != "false" ]; then
+            ./scripts/config --file out/.config --enable KSU_SUSFS
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME
+            ./scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            ./scripts/config --file out/.config --enable KSU_SUSFS_OPEN_REDIRECT
+            
+            if [ "${{ inputs.enable_debug }}" = "true" ]; then
+              ./scripts/config --file out/.config --enable KSU_SUSFS_ENABLE_LOG
+              ./scripts/config --file out/.config --enable KSU_DEBUG
+            else
+              ./scripts/config --file out/.config --disable KSU_SUSFS_ENABLE_LOG
+            fi
+          fi
+          
+          make O=out ARCH=arm64 olddefconfig \
+            CC="$HOME/toolchains/clang/bin/clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC="$HOME/toolchains/clang/bin/clang"
+          
+          echo ""
+          echo "=== KernelSU Config ==="
+          grep -E "CONFIG_KSU|CONFIG_KPM" out/.config
+          echo ""
+          echo "=== SUSFS Config ==="
+          grep -E "CONFIG_KSU_SUSFS" out/.config || true
+      
+      - name: Build kernel
+        run: |
+          echo "=== Building kernel ==="
+          
+          JOBS=$(nproc --all)
+          echo "Building with ${JOBS} jobs..."
+          
+          make -j${JOBS} O=out ARCH=arm64 \
+            CC="$HOME/toolchains/clang/bin/clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            HOSTCC="$HOME/toolchains/clang/bin/clang" \
+            HOSTLD="$HOME/toolchains/clang/bin/ld.lld" \
+            2>&1 | tee build.log
+          
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "::error::Kernel Image not found!"
+            tail -100 build.log
+            exit 1
+          fi
+          
+          cp out/arch/arm64/boot/Image ${{ env.KERNEL_NAME }}-Image
+          [ -f "out/arch/arm64/boot/Image.gz" ] && cp out/arch/arm64/boot/Image.gz ${{ env.KERNEL_NAME }}-Image.gz
+          [ -f "out/arch/arm64/boot/Image.gz-dtb" ] && cp out/arch/arm64/boot/Image.gz-dtb ${{ env.KERNEL_NAME }}-Image.gz-dtb
+          
+          echo ""
+          echo "=== KSU/SUSFS Symbols ==="
+          if [ -f "out/System.map" ]; then
+            grep -i "ksu\|susfs" out/System.map | head -30 || echo "No symbols found"
+          fi
+          
+          ls -la ${{ env.KERNEL_NAME }}-*
+      
+      - name: Package kernel
+        run: |
+          echo "=== Packaging kernel ==="
+          
+          mkdir -p output
+          
+          cp ${{ env.KERNEL_NAME }}-Image output/
+          [ -f "${{ env.KERNEL_NAME }}-Image.gz" ] && cp ${{ env.KERNEL_NAME }}-Image.gz output/
+          [ -f "${{ env.KERNEL_NAME }}-Image.gz-dtb" ] && cp ${{ env.KERNEL_NAME }}-Image.gz-dtb output/
+          
+          cp out/.config output/kernel.config
+          
+          [ -d "out/modules" ] && cp -r out/modules output/
+          
+          cat > output/version.txt << EOF
+          Kernel: ${{ env.KERNEL_NAME }}
+          Version: ${{ env.KERNEL_VERSION }}
+          Config: ${{ env.DEVICE_CONFIG }}
+          Date: ${{ env.BUILD_DATE }}
+          ReSukiSU: ${{ steps.resukisu.outputs.ksu_commit }}
+          SUSFS: ${{ steps.susfs.outputs.susfs_commit }}
+          GitHub Run: ${{ github.run_number }}
+          EOF
+          
+          cd output
+          zip -r ../${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip *
+          cd ..
+          
+          sha256sum ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip > ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          
+          ls -la ${{ env.KERNEL_NAME }}-*
+      
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}
+          path: |
+            output/
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip
+            ${{ env.KERNEL_NAME }}-${{ env.BUILD_DATE }}.zip.sha256
+          retention-days: 30
+      
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.BUILD_DATE }}
+          path: build.log
+          retention-days: 7
+      
+      - name: Upload kernel config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config-${{ env.BUILD_DATE }}
+          path: out/.config
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
