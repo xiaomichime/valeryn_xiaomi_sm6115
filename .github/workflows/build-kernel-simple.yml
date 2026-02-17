@@ -1,0 +1,166 @@
+name: Build Kernel ReSukiSU SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: 'Device defconfig'
+        required: true
+        default: 'chime-stock_defconfig'
+        type: choice
+        options:
+          - chime-stock_defconfig
+          - bengal_defconfig
+          - bengal-perf_defconfig
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: true
+        default: 'kernel-4.19'
+        type: choice
+        options:
+          - kernel-4.19
+          - kernel-5.4
+          - master
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  KERNEL_NAME: Valeryn-KSU
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev libncurses5-dev device-tree-compiler python3 zip unzip git patch ccache
+
+      - name: Setup Clang
+        run: |
+          mkdir -p ~/toolchains
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang ~/toolchains/clang
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+
+      - name: Clone ReSukiSU
+        run: |
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+
+      - name: Clone SUSFS (for kernel source files only)
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          git clone --depth=1 --branch ${{ inputs.susfs_branch }} https://gitlab.com/simonpunk/susfs4ksu.git susfs || git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+
+      - name: Integrate ReSukiSU
+        run: |
+          ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
+          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Copy SUSFS kernel files
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          mkdir -p include/linux fs
+          cp susfs/kernel_patches/include/linux/susfs.h include/linux/ || true
+          cp susfs/kernel_patches/include/linux/susfs_def.h include/linux/ || true
+          cp susfs/kernel_patches/include/linux/sus_su.h include/linux/ || true
+          cp susfs/kernel_patches/fs/susfs.c fs/ || true
+          cp susfs/kernel_patches/fs/sus_su.c fs/ || true
+          ls -la include/linux/sus*.h fs/sus*.c
+
+      - name: Apply SUSFS kernel patches
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          PATCH="susfs/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          if [ -f "$PATCH" ]; then
+            for level in 1 0 2; do
+              if patch -p${level} --dry-run < "$PATCH" 2>/dev/null; then
+                patch -p${level} < "$PATCH"
+                echo "Patch applied"
+                break
+              fi
+            done || echo "Patch may have partial failures (this is OK)"
+          else
+            echo "Patch file not found, skipping"
+          fi
+
+      - name: Add SUSFS to fs/Makefile
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "" >> fs/Makefile
+            echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+          fi
+
+      - name: Configure kernel
+        run: |
+          make O=out ARCH=arm64 ${{ inputs.device_config }} CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+          
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --enable KALLSYMS
+          ./scripts/config --file out/.config --enable KALLSYMS_ALL
+          ./scripts/config --file out/.config --enable KPROBES
+          ./scripts/config --file out/.config --enable KPM
+          ./scripts/config --file out/.config --enable THREAD_INFO_IN_TASK
+          
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            ./scripts/config --file out/.config --enable KSU_SUSFS
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP
+            ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME
+            ./scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          fi
+          
+          make O=out ARCH=arm64 olddefconfig CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+          
+          echo "=== Config Check ==="
+          grep -E "CONFIG_KSU|CONFIG_KPM|CONFIG_KSU_SUSFS" out/.config || true
+
+      - name: Build kernel
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee build.log
+          
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "Build failed!"
+            tail -100 build.log
+            exit 1
+          fi
+          
+          cp out/arch/arm64/boot/Image ${{ env.KERNEL_NAME }}-Image
+          ls -la ${{ env.KERNEL_NAME }}-*
+
+      - name: Package kernel
+        run: |
+          mkdir -p output
+          cp ${{ env.KERNEL_NAME }}-Image output/
+          cp out/.config output/kernel.config
+          cd output && zip -r ../${{ env.KERNEL_NAME }}.zip * && cd ..
+          sha256sum ${{ env.KERNEL_NAME }}.zip > ${{ env.KERNEL_NAME }}.zip.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}
+          path: |
+            ${{ env.KERNEL_NAME }}.zip
+            ${{ env.KERNEL_NAME }}.zip.sha256
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
