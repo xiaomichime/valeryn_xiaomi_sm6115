@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev \
             libncurses5-dev device-tree-compiler python3 zip unzip git patch ccache \
-            lld llvm clang gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+            lld llvm clang gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu perl
 
       - name: Setup Proton Clang toolchain
         run: |
@@ -76,6 +76,18 @@ jobs:
           echo "Fixed TASKS_TRACE_RCU in Kconfig:"
           grep -A2 "config TASKS_TRACE_RCU" kernel/rcu/Kconfig
 
+      - name: Fix BPF sysctl missing ifdef guard
+        run: |
+          # The bpf_stats_enabled entry in kernel/sysctl.c references bpf_stats_handler
+          # which is wrapped in #ifdef CONFIG_BPF_SYSCALL, but the table entry itself is not.
+          # This causes build errors when BPF is disabled.
+          
+          # Use perl for multiline replacement - add ifdef guards around bpf_stats_enabled entry
+          perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
+          
+          echo "Fixed bpf_stats_enabled sysctl entry:"
+          grep -B2 -A10 "bpf_stats_enabled" kernel/sysctl.c | head -20
+
       - name: Configure kernel for Non-GKI
         run: |
           make ARCH=arm64 O=out chime-stock_defconfig
@@ -131,6 +143,8 @@ jobs:
         run: |
           export PATH="$HOME/toolchains/clang/bin:$PATH"
 
+          # Build without LLVM=1 to avoid VDSO linker issues
+          # Use explicit cross-compiler settings
           make -j$(nproc) \
             ARCH=arm64 \
             O=out \
@@ -138,8 +152,12 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            LD=aarch64-linux-gnu-ld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
             2>&1 | tee build.log
 
       - name: Check build result
