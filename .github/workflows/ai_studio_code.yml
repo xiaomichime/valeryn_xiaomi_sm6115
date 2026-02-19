@@ -50,21 +50,18 @@ jobs:
 
       - name: Integrate SUSFS
         run: |
-          # Clone the official simonpunk GitLab repo
-          # Fallback to ZIP if git clone fails/asks for credentials
+          # Clone SUSFS
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
             wget https://gitlab.com/simonpunk/susfs4ksu/-/archive/main/susfs4ksu-main.zip
             unzip susfs4ksu-main.zip
             mv susfs4ksu-main susfs
           }
           
-          # Smart Copy: Find files regardless of internal repo structure
+          # Smart Copy: Find and move files regardless of repo structure
           find susfs -name "susfs.h" -exec cp {} include/linux/ \;
           find susfs -name "susfs.c" -exec cp {} fs/ \;
 
           # Apply SUSFS Patches (Specifically for 4.19)
-          echo "Applying SUSFS patches..."
-          # Look for the 4.19 patches inside the repo
           FS_PATCH=$(find susfs -name "fs_susfs.patch" | grep "4.19" | head -1)
           SYS_PATCH=$(find susfs -name "non_gki_sysctl.patch" | grep "4.19" | head -1)
           KSU_PATCH=$(find susfs -name "*susfs.patch*" | grep "KernelSU" | head -1)
@@ -72,7 +69,6 @@ jobs:
           [ -f "$FS_PATCH" ] && patch -p1 < "$FS_PATCH" || echo "FS patch not found or failed"
           [ -f "$SYS_PATCH" ] && patch -p1 < "$SYS_PATCH" || echo "Sysctl patch not found or failed"
           
-          # Bridge KernelSU and SUSFS
           if [ -f "$KSU_PATCH" ]; then
             cd KernelSU
             patch -p1 < "../$KSU_PATCH" || echo "KSU SUSFS patch failed"
@@ -90,19 +86,14 @@ jobs:
 
       - name: Configure Kernel
         run: |
-          DEFCONFIG_PATH=""
+          # STRICTLY use only arch/arm64/configs/chime-stock_defconfig
           if [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
-            DEFCONFIG_PATH="chime-stock_defconfig"
-          elif [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
-            DEFCONFIG_PATH="vendor/chime-stock_defconfig"
-          fi
-
-          if [ -z "$DEFCONFIG_PATH" ]; then
-            echo "Error: chime-stock_defconfig not found!"
+            echo "Found chime-stock_defconfig in arch/arm64/configs/"
+            make ARCH=arm64 O=out chime-stock_defconfig
+          else
+            echo "CRITICAL ERROR: arch/arm64/configs/chime-stock_defconfig not found!"
             exit 1
           fi
-
-          make ARCH=arm64 O=out $DEFCONFIG_PATH
 
           cat >> out/.config << 'CONFIGEOF'
           # KernelSU
@@ -162,6 +153,7 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
+          
           cp ../out/arch/arm64/boot/${{ env.KERNEL_FILE }} . || cp ../out/arch/arm64/boot/Image .
           [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
 
