@@ -50,31 +50,32 @@ jobs:
 
       - name: Integrate SUSFS
         run: |
-          # Use the user-provided GitLab URL
-          # We use "|| true" and a zip fallback in case GitLab blocks the runner's IP
+          # Clone the official simonpunk GitLab repo
+          # Fallback to ZIP if git clone fails/asks for credentials
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
-            echo "GitLab clone failed, attempting to download as ZIP..."
             wget https://gitlab.com/simonpunk/susfs4ksu/-/archive/main/susfs4ksu-main.zip
             unzip susfs4ksu-main.zip
             mv susfs4ksu-main susfs
           }
           
-          # Copy SUSFS files to kernel source
-          # Note: Paths based on simonpunk's susfs4ksu structure
-          cp susfs/kernel/include/linux/susfs.h include/linux/
-          cp susfs/kernel/fs/susfs.c fs/
+          # Smart Copy: Find files regardless of internal repo structure
+          find susfs -name "susfs.h" -exec cp {} include/linux/ \;
+          find susfs -name "susfs.c" -exec cp {} fs/ \;
 
-          # Apply SUSFS Patches (Targeting 4.19 for chime)
+          # Apply SUSFS Patches (Specifically for 4.19)
           echo "Applying SUSFS patches..."
-          patch -p1 < susfs/patches/4.19/fs_susfs.patch || echo "FS patch failed"
-          patch -p1 < susfs/patches/4.19/non_gki_sysctl.patch || echo "Sysctl patch failed"
+          # Look for the 4.19 patches inside the repo
+          FS_PATCH=$(find susfs -name "fs_susfs.patch" | grep "4.19" | head -1)
+          SYS_PATCH=$(find susfs -name "non_gki_sysctl.patch" | grep "4.19" | head -1)
+          KSU_PATCH=$(find susfs -name "*susfs.patch*" | grep "KernelSU" | head -1)
+
+          [ -f "$FS_PATCH" ] && patch -p1 < "$FS_PATCH" || echo "FS patch not found or failed"
+          [ -f "$SYS_PATCH" ] && patch -p1 < "$SYS_PATCH" || echo "Sysctl patch not found or failed"
           
           # Bridge KernelSU and SUSFS
-          # simonpunk's repo usually has a KernelSU specific patch
-          KSU_PATCH=$(find susfs/KernelSU/ -name "*susfs.patch*" | head -1)
           if [ -f "$KSU_PATCH" ]; then
             cd KernelSU
-            patch -p1 < ../$KSU_PATCH || echo "KSU SUSFS patch failed"
+            patch -p1 < "../$KSU_PATCH" || echo "KSU SUSFS patch failed"
             cd ..
           fi
 
@@ -89,7 +90,6 @@ jobs:
 
       - name: Configure Kernel
         run: |
-          # Strictly find chime-stock_defconfig
           DEFCONFIG_PATH=""
           if [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
             DEFCONFIG_PATH="chime-stock_defconfig"
@@ -111,13 +111,11 @@ jobs:
           CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-          
           # SUSFS
           CONFIG_SUSFS=y
           CONFIG_KSU_SUSFS=y
           CONFIG_SUSFS_SHOW_SPOOFED_PROCFS=y
           CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          
           # Compatibility
           CONFIG_KPM=y
           CONFIG_KALLSYMS=y
@@ -164,7 +162,6 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
-          
           cp ../out/arch/arm64/boot/${{ env.KERNEL_FILE }} . || cp ../out/arch/arm64/boot/Image .
           [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
 
