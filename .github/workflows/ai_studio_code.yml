@@ -1,10 +1,10 @@
-name: Build Kernel with ReSukiSU + SUSFS (AnyKernel3)
+name: Build Kernel with ReSukiSU (AnyKernel3)
 
 on:
   workflow_dispatch:
 
 env:
-  KERNEL_NAME: Valeryn-KSU-SUSFS
+  KERNEL_NAME: Valeryn-KSU
   DEVICE_NAME: chime
 
 jobs:
@@ -37,12 +37,14 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           
+          # Symlink logic
           if [ -d "drivers/kernelsu" ]; then
             echo "KernelSU directory exists"
           else
             ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
           fi
           
+          # Makefile integration
           if ! grep -q "kernelsu" drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
@@ -50,91 +52,27 @@ jobs:
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
-      - name: Integrate SUSFS
-        run: |
-          echo "=== Downloading SUSFS ==="
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
-            echo "GitLab clone failed, using ZIP fallback..."
-            wget https://gitlab.com/simonpunk/susfs4ksu/-/archive/main/susfs4ksu-main.zip
-            unzip susfs4ksu-main.zip
-            mv susfs4ksu-main susfs
-          }
-
-          echo "=== DEBUG: SUSFS File Structure ==="
-          ls -R susfs
-
-          echo "=== Installing SUSFS Kernel Files ==="
-          # Copy headers and source
-          find susfs -name "susfs.h" -exec cp {} include/linux/ \;
-          find susfs -name "susfs_def.h" -exec cp {} include/linux/ \;
-          find susfs -name "susfs.c" -exec cp {} fs/ \;
-
-          echo "=== Applying SUSFS Kernel Patches ==="
-          # Try to find the patch with a broader search pattern
-          # Standard name in this repo is often "50_add_susfs_in_kernel-4.19.patch"
-          FS_PATCH=$(find susfs -name "*kernel*4.19*.patch" | head -1)
-          
-          # If not found, try the old name
-          if [ -z "$FS_PATCH" ]; then
-             FS_PATCH=$(find susfs -name "fs_susfs.patch" | head -1)
-          fi
-
-          if [ -f "$FS_PATCH" ]; then
-            echo "Applying Kernel Patch: $FS_PATCH"
-            patch -p1 < "$FS_PATCH" || echo "FS patch failed (check if already applied)"
-          else
-            echo "CRITICAL ERROR: SUSFS Kernel Patch not found!"
-            echo "Available patches:"
-            find susfs -name "*.patch"
-            exit 1
-          fi
-
-          echo "=== Applying SUSFS to KernelSU ==="
-          # Find the KSU integration patch
-          KSU_PATCH=$(find susfs -name "*enable_susfs_for_ksu.patch" | head -1)
-
-          if [ -f "$KSU_PATCH" ]; then
-            echo "Applying KSU Patch: $KSU_PATCH"
-            cd KernelSU
-            patch -p1 < "../$KSU_PATCH" || echo "KSU Patch failed"
-            cd ..
-          else
-            echo "CRITICAL ERROR: KSU Patch not found!"
-            echo "Available patches in susfs:"
-            find susfs -name "*.patch"
-            exit 1
-          fi
-
-          echo "=== FIXING MISSING HEADER ERROR ==="
-          # 1. Copy the missing header DIRECTLY into the KernelSU folder
-          find susfs -name "susfs_def.h" -exec cp {} KernelSU/kernel/ \;
-          
-          # 2. Modify sucompat.c to include the local file
-          if [ -f "KernelSU/kernel/sucompat.c" ]; then
-            echo "Patching sucompat.c include path..."
-            sed -i 's|#include <linux/susfs_def.h>|#include "susfs_def.h"|g' KernelSU/kernel/sucompat.c
-          fi
-
       - name: Fix Compilation Errors
         run: |
-          # Fix 'no member named last_state_idx' in menu.c
+          # 1. Fix 'no member named last_state_idx' in menu.c (Common 4.19 error)
           if [ -f "drivers/cpuidle/governors/menu.c" ]; then
             sed -i 's/data->last_state_idx = idx;/\/\/ data->last_state_idx = idx;/g' drivers/cpuidle/governors/menu.c
             sed -i 's/return data->last_state_idx;/\/\/ return data->last_state_idx;\n\t\treturn 0;/g' drivers/cpuidle/governors/menu.c
           fi
 
-          # Fix RCU Kconfig
+          # 2. Fix RCU Kconfig (Required for KSU)
           if [ -f "kernel/rcu/Kconfig" ]; then
             sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
           fi
 
-          # Fix BPF sysctl
+          # 3. Fix BPF sysctl (Fixes undefined reference)
           if [ -f "kernel/sysctl.c" ] && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
             perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
           fi
 
       - name: Configure Kernel
         run: |
+          # STRICTLY use chime-stock_defconfig from vendor/
           if [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
             DEFCONFIG="vendor/chime-stock_defconfig"
           elif [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
@@ -147,21 +85,17 @@ jobs:
           echo "Using defconfig: $DEFCONFIG"
           make ARCH=arm64 O=out $DEFCONFIG
 
-          # Disable IKCONFIG
+          # Disable IKCONFIG to prevent 'config_data.gz' build error
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
-          # Enable KernelSU and SUSFS
+          # Enable KernelSU (ReSukiSU) Only
           cat >> out/.config << 'CONFIGEOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
           CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-          CONFIG_SUSFS=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_SUSFS_SHOW_SPOOFED_PROCFS=y
-          CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KPM=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
@@ -212,7 +146,7 @@ jobs:
 
           cat > anykernel.sh << 'ANYKERNELEOF'
           properties() { '
-          kernel.string=Valeryn-KSU-SUSFS by ReSukiSU
+          kernel.string=Valeryn-KSU by ReSukiSU
           do.devicecheck=1
           do.modules=0
           do.systemless=1
