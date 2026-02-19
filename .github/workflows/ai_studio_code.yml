@@ -1,7 +1,7 @@
 name: Build Kernel with ReSukiSU + SUSFS (AnyKernel3)
 
 on:
-  workflow_dispatch: # Manual trigger only
+  workflow_dispatch:
 
 env:
   KERNEL_NAME: Valeryn-KSU-SUSFS
@@ -50,24 +50,33 @@ jobs:
 
       - name: Integrate SUSFS
         run: |
-          # Clone SUSFS Patches and Files
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4linux.git susfs
+          # Use the user-provided GitLab URL
+          # We use "|| true" and a zip fallback in case GitLab blocks the runner's IP
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
+            echo "GitLab clone failed, attempting to download as ZIP..."
+            wget https://gitlab.com/simonpunk/susfs4ksu/-/archive/main/susfs4ksu-main.zip
+            unzip susfs4ksu-main.zip
+            mv susfs4ksu-main susfs
+          }
           
           # Copy SUSFS files to kernel source
+          # Note: Paths based on simonpunk's susfs4ksu structure
           cp susfs/kernel/include/linux/susfs.h include/linux/
           cp susfs/kernel/fs/susfs.c fs/
 
-          # Apply SUSFS Patches (Assuming 4.19 kernel for chime)
-          # We apply patches for fs, sysctl, and ReSukiSU integration
-          cp susfs/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-          
+          # Apply SUSFS Patches (Targeting 4.19 for chime)
           echo "Applying SUSFS patches..."
-          patch -p1 < susfs/patches/4.19/fs_susfs.patch || echo "FS patch failed, check manually"
-          patch -p1 < susfs/patches/4.19/non_gki_sysctl.patch || echo "Sysctl patch failed, check manually"
+          patch -p1 < susfs/patches/4.19/fs_susfs.patch || echo "FS patch failed"
+          patch -p1 < susfs/patches/4.19/non_gki_sysctl.patch || echo "Sysctl patch failed"
           
-          cd KernelSU
-          patch -p1 < 10_enable_susfs_for_ksu.patch || echo "KSU SUSFS patch failed"
-          cd ..
+          # Bridge KernelSU and SUSFS
+          # simonpunk's repo usually has a KernelSU specific patch
+          KSU_PATCH=$(find susfs/KernelSU/ -name "*susfs.patch*" | head -1)
+          if [ -f "$KSU_PATCH" ]; then
+            cd KernelSU
+            patch -p1 < ../$KSU_PATCH || echo "KSU SUSFS patch failed"
+            cd ..
+          fi
 
       - name: Apply Kernel Patches (RCU & BPF)
         run: |
@@ -80,7 +89,7 @@ jobs:
 
       - name: Configure Kernel
         run: |
-          # Strictly search only for chime-stock_defconfig
+          # Strictly find chime-stock_defconfig
           DEFCONFIG_PATH=""
           if [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
             DEFCONFIG_PATH="chime-stock_defconfig"
@@ -109,7 +118,7 @@ jobs:
           CONFIG_SUSFS_SHOW_SPOOFED_PROCFS=y
           CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           
-          # General Requirements
+          # Compatibility
           CONFIG_KPM=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
@@ -155,12 +164,13 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
+          
           cp ../out/arch/arm64/boot/${{ env.KERNEL_FILE }} . || cp ../out/arch/arm64/boot/Image .
           [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
 
           cat > anykernel.sh << 'ANYKERNELEOF'
           properties() { '
-          kernel.string=Valeryn-KSU + SUSFS by ReSukiSU
+          kernel.string=Valeryn-KSU-SUSFS by ReSukiSU
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -183,19 +193,18 @@ jobs:
 
           zip -r9 ../${{ env.KERNEL_NAME }}-AnyKernel3.zip *
 
-      - name: Upload Artifacts
+      - name: Upload Flashable Zip
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.KERNEL_NAME }}-Build
-          path: |
-            *.zip
-            out/arch/arm64/boot/Image*
-            out/.config
+          name: ${{ env.KERNEL_NAME }}-AnyKernel3
+          path: ${{ env.KERNEL_NAME }}-AnyKernel3.zip
           retention-days: 7
 
-      - name: Upload Build Log on Failure
-        if: failure()
+      - name: Upload Build Info
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-susfs
-          path: build.log
+          name: Build-Logs
+          path: |
+            out/.config
+            build.log
