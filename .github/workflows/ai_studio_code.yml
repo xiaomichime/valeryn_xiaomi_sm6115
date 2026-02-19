@@ -50,35 +50,46 @@ jobs:
 
       - name: Integrate SUSFS
         run: |
-          # Clone SUSFS
+          # 1. Clone SUSFS
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
+            echo "GitLab clone failed, downloading ZIP..."
             wget https://gitlab.com/simonpunk/susfs4ksu/-/archive/main/susfs4ksu-main.zip
             unzip susfs4ksu-main.zip
             mv susfs4ksu-main susfs
           }
-          
-          # 1. Copy Header Files (CRITICAL FIX: Added susfs_def.h)
-          find susfs -name "susfs.h" -exec cp {} include/linux/ \;
-          find susfs -name "susfs_def.h" -exec cp {} include/linux/ \;
-          
-          # 2. Copy Source File
-          find susfs -name "susfs.c" -exec cp {} fs/ \;
 
-          # 3. Apply SUSFS Patches (Specifically for 4.19)
+          # 2. Copy Header Files (CRITICAL FIX)
+          # We copy to include/linux AND drivers/kernelsu to be absolutely safe
+          cp susfs/kernel/include/linux/susfs.h include/linux/ 2>/dev/null || find susfs -name "susfs.h" -exec cp {} include/linux/ \;
+          cp susfs/kernel/include/linux/susfs_def.h include/linux/ 2>/dev/null || find susfs -name "susfs_def.h" -exec cp {} include/linux/ \;
+          
+          # Also copy susfs_def.h directly to KernelSU folder as a fallback
+          cp include/linux/susfs_def.h drivers/kernelsu/ 2>/dev/null || true
+          
+          # Verify files exist
+          echo "Verifying SUSFS headers:"
+          ls -l include/linux/susfs.h || echo "ERROR: susfs.h missing"
+          ls -l include/linux/susfs_def.h || echo "ERROR: susfs_def.h missing"
+
+          # 3. Copy Source File
+          cp susfs/kernel/fs/susfs.c fs/ 2>/dev/null || find susfs -name "susfs.c" -exec cp {} fs/ \;
+
+          # 4. Apply SUSFS Patches
           FS_PATCH=$(find susfs -name "fs_susfs.patch" | grep "4.19" | head -1)
           SYS_PATCH=$(find susfs -name "non_gki_sysctl.patch" | grep "4.19" | head -1)
           KSU_PATCH=$(find susfs -name "*susfs.patch*" | grep "KernelSU" | head -1)
 
-          [ -f "$FS_PATCH" ] && patch -p1 < "$FS_PATCH" || echo "FS patch not found or failed"
-          [ -f "$SYS_PATCH" ] && patch -p1 < "$SYS_PATCH" || echo "Sysctl patch not found or failed"
+          [ -f "$FS_PATCH" ] && patch -p1 < "$FS_PATCH" || echo "FS patch not found/failed"
+          [ -f "$SYS_PATCH" ] && patch -p1 < "$SYS_PATCH" || echo "Sysctl patch not found/failed"
           
           if [ -f "$KSU_PATCH" ]; then
+            echo "Applying KSU patch: $KSU_PATCH"
             cd KernelSU
             patch -p1 < "../$KSU_PATCH" || echo "KSU SUSFS patch failed"
             cd ..
           fi
 
-      - name: Fix Compilation Errors (Menu.c & RCU/BPF)
+      - name: Fix Compilation Errors
         run: |
           # Fix 'no member named last_state_idx' in menu.c
           if [ -f "drivers/cpuidle/governors/menu.c" ]; then
