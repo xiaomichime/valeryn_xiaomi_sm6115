@@ -37,14 +37,12 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           
-          # Symlink logic
           if [ -d "drivers/kernelsu" ]; then
             echo "KernelSU directory exists"
           else
             ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
           fi
           
-          # Makefile integration
           if ! grep -q "kernelsu" drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
@@ -54,25 +52,22 @@ jobs:
 
       - name: Fix Compilation Errors
         run: |
-          # 1. Fix 'no member named last_state_idx' in menu.c (Common 4.19 error)
+          # Fix 'no member named last_state_idx' in menu.c
           if [ -f "drivers/cpuidle/governors/menu.c" ]; then
             sed -i 's/data->last_state_idx = idx;/\/\/ data->last_state_idx = idx;/g' drivers/cpuidle/governors/menu.c
             sed -i 's/return data->last_state_idx;/\/\/ return data->last_state_idx;\n\t\treturn 0;/g' drivers/cpuidle/governors/menu.c
           fi
-
-          # 2. Fix RCU Kconfig (Required for KSU)
+          # Fix RCU Kconfig
           if [ -f "kernel/rcu/Kconfig" ]; then
             sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
           fi
-
-          # 3. Fix BPF sysctl (Fixes undefined reference)
+          # Fix BPF sysctl
           if [ -f "kernel/sysctl.c" ] && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
             perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
           fi
 
       - name: Configure Kernel
         run: |
-          # STRICTLY use chime-stock_defconfig from vendor/
           if [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
             DEFCONFIG="vendor/chime-stock_defconfig"
           elif [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
@@ -85,11 +80,11 @@ jobs:
           echo "Using defconfig: $DEFCONFIG"
           make ARCH=arm64 O=out $DEFCONFIG
 
-          # Disable IKCONFIG to prevent 'config_data.gz' build error
+          # Disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
-          # Enable KernelSU (ReSukiSU) Only
+          # Enable KernelSU + DTBO Support
           cat >> out/.config << 'CONFIGEOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
@@ -102,6 +97,9 @@ jobs:
           CONFIG_KPROBES=y
           # CONFIG_BPF is not set
           CONFIG_TASKS_TRACE_RCU=y
+          
+          # Force DTBO generation
+          CONFIG_BUILD_ARM64_DT_OVERLAY=y
           CONFIGEOF
 
           make ARCH=arm64 O=out olddefconfig
@@ -120,19 +118,45 @@ jobs:
 
       - name: Prepare DTB and DTBO
         run: |
-          make ARCH=arm64 O=out dtbs -j$(nproc) CC=clang CROSS_COMPILE=aarch64-linux-gnu-
+          echo "=== Building DTBs ==="
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          make ARCH=arm64 O=out dtbs -j$(nproc) \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          echo "=== DEBUG: listing built DTB files ==="
+          find out/arch/arm64/boot/dts -name "*.dtb" | head -n 10
           
-          DTB_PATH=$(find out/arch/arm64/boot/dts -name "*chime*.dtb" | head -1)
-          if [ -f "$DTB_PATH" ] && [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            cat out/arch/arm64/boot/Image.gz "$DTB_PATH" > out/arch/arm64/boot/Image.gz-dtb
-            echo "KERNEL_FILE=Image.gz-dtb" >> $GITHUB_ENV
+          echo "=== Finding Correct DTB ==="
+          # Try finding by device codenames or platform name
+          DTB_PATH=$(find out/arch/arm64/boot/dts -name "*chime*.dtb" -o -name "*citrus*.dtb" -o -name "*lime*.dtb" -o -name "*bengal*.dtb" -o -name "*sm6115*.dtb" | head -1)
+
+          if [ -n "$DTB_PATH" ]; then
+            echo "Found DTB: $DTB_PATH"
+            # Append DTB to Image.gz
+            if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+              cat out/arch/arm64/boot/Image.gz "$DTB_PATH" > out/arch/arm64/boot/Image.gz-dtb
+              echo "KERNEL_FILE=Image.gz-dtb" >> $GITHUB_ENV
+            else
+              echo "Error: Image.gz not found"
+              exit 1
+            fi
           else
+            echo "WARNING: No DTB found! Check the debug list above."
             echo "KERNEL_FILE=Image.gz" >> $GITHUB_ENV
           fi
 
+          echo "=== Generating DTBO Image ==="
           DTBO_FILES=$(find out/arch/arm64/boot/dts -name "*.dtbo")
+          
           if [ -n "$DTBO_FILES" ]; then
+            echo "Found DTBO files, creating dtbo.img..."
+            # Simple concatenation works for Chime/SM6115
             cat $DTBO_FILES > out/arch/arm64/boot/dtbo.img
+          else
+            echo "WARNING: No .dtbo files found. Skipping DTBO."
           fi
 
       - name: Package with AnyKernel3
@@ -141,8 +165,21 @@ jobs:
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
           
-          cp ../out/arch/arm64/boot/${{ env.KERNEL_FILE }} . || cp ../out/arch/arm64/boot/Image .
-          [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
+          # Copy Kernel
+          if [ -f "../out/arch/arm64/boot/${{ env.KERNEL_FILE }}" ]; then
+            cp "../out/arch/arm64/boot/${{ env.KERNEL_FILE }}" .
+          else
+             # Fallback
+             cp ../out/arch/arm64/boot/Image .
+          fi
+          
+          # Copy DTBO if it was successfully built
+          if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
+            cp ../out/arch/arm64/boot/dtbo.img .
+            echo "DTBO included in zip"
+          else
+            echo "DTBO missing from zip"
+          fi
 
           cat > anykernel.sh << 'ANYKERNELEOF'
           properties() { '
