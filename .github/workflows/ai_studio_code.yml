@@ -37,7 +37,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           
-          if [ -d "drivers/kernelsu" ]; then
+          if; then
             echo "KernelSU directory exists"
           else
             ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
@@ -52,25 +52,22 @@ jobs:
 
       - name: Fix Compilation Errors
         run: |
-          # Fix 'no member named last_state_idx' in menu.c
-          if [ -f "drivers/cpuidle/governors/menu.c" ]; then
+          if; then
             sed -i 's/data->last_state_idx = idx;/\/\/ data->last_state_idx = idx;/g' drivers/cpuidle/governors/menu.c
             sed -i 's/return data->last_state_idx;/\/\/ return data->last_state_idx;\n\t\treturn 0;/g' drivers/cpuidle/governors/menu.c
           fi
-          # Fix RCU Kconfig
-          if [ -f "kernel/rcu/Kconfig" ]; then
+          if; then
             sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
           fi
-          # Fix BPF sysctl
-          if [ -f "kernel/sysctl.c" ] && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
+          if && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
             perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
           fi
 
       - name: Configure Kernel
         run: |
-          if [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
+          if; then
             DEFCONFIG="vendor/chime-stock_defconfig"
-          elif [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
+          elif; then
             DEFCONFIG="chime-stock_defconfig"
           else
             echo "CRITICAL ERROR: Defconfig not found!"
@@ -84,7 +81,7 @@ jobs:
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
-          # Enable KernelSU + DTBO Support
+          # Enable KernelSU ONLY
           cat >> out/.config << 'CONFIGEOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
@@ -97,16 +94,15 @@ jobs:
           CONFIG_KPROBES=y
           # CONFIG_BPF is not set
           CONFIG_TASKS_TRACE_RCU=y
-          
-          # Force DTBO generation
-          CONFIG_BUILD_ARM64_DT_OVERLAY=y
           CONFIGEOF
 
           make ARCH=arm64 O=out olddefconfig
 
-      - name: Build Kernel
+      - name: Build Kernel & DTBs
         run: |
           export PATH="$HOME/toolchains/clang/bin:$PATH"
+          
+          # Build Kernel
           make -j$(nproc) ARCH=arm64 O=out \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -116,48 +112,12 @@ jobs:
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             2>&1 | tee build.log
 
-      - name: Prepare DTB and DTBO
-        run: |
-          echo "=== Building DTBs ==="
-          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          # Build DTBs
           make ARCH=arm64 O=out dtbs -j$(nproc) \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-
-          echo "=== DEBUG: listing built DTB files ==="
-          find out/arch/arm64/boot/dts -name "*.dtb" | head -n 10
-          
-          echo "=== Finding Correct DTB ==="
-          # Try finding by device codenames or platform name
-          DTB_PATH=$(find out/arch/arm64/boot/dts -name "*chime*.dtb" -o -name "*citrus*.dtb" -o -name "*lime*.dtb" -o -name "*bengal*.dtb" -o -name "*sm6115*.dtb" | head -1)
-
-          if [ -n "$DTB_PATH" ]; then
-            echo "Found DTB: $DTB_PATH"
-            # Append DTB to Image.gz
-            if [ -f "out/arch/arm64/boot/Image.gz" ]; then
-              cat out/arch/arm64/boot/Image.gz "$DTB_PATH" > out/arch/arm64/boot/Image.gz-dtb
-              echo "KERNEL_FILE=Image.gz-dtb" >> $GITHUB_ENV
-            else
-              echo "Error: Image.gz not found"
-              exit 1
-            fi
-          else
-            echo "WARNING: No DTB found! Check the debug list above."
-            echo "KERNEL_FILE=Image.gz" >> $GITHUB_ENV
-          fi
-
-          echo "=== Generating DTBO Image ==="
-          DTBO_FILES=$(find out/arch/arm64/boot/dts -name "*.dtbo")
-          
-          if [ -n "$DTBO_FILES" ]; then
-            echo "Found DTBO files, creating dtbo.img..."
-            # Simple concatenation works for Chime/SM6115
-            cat $DTBO_FILES > out/arch/arm64/boot/dtbo.img
-          else
-            echo "WARNING: No .dtbo files found. Skipping DTBO."
-          fi
 
       - name: Package with AnyKernel3
         run: |
@@ -165,22 +125,26 @@ jobs:
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
           
-          # Copy Kernel
-          if [ -f "../out/arch/arm64/boot/${{ env.KERNEL_FILE }}" ]; then
-            cp "../out/arch/arm64/boot/${{ env.KERNEL_FILE }}" .
+          # 1. Copy the pure kernel (DO NOT APPEND DTB)
+          if; then
+            cp ../out/arch/arm64/boot/Image.gz .
+            echo "Copied Image.gz"
           else
-             # Fallback
-             cp ../out/arch/arm64/boot/Image .
-          fi
-          
-          # Copy DTBO if it was successfully built
-          if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
-            cp ../out/arch/arm64/boot/dtbo.img .
-            echo "DTBO included in zip"
-          else
-            echo "DTBO missing from zip"
+            echo "Error: Image.gz not found!"
+            exit 1
           fi
 
+          # 2. Find and copy the DTB as a separate file
+          # AnyKernel3 natively injects 'dtb' into header v2 boot images
+          DTB_PATH=$(find ../out/arch/arm64/boot/dts -name "*chime*.dtb" -o -name "*bengal*.dtb" -o -name "*sm6115*.dtb" | head -1)
+          if; then
+            cp "$DTB_PATH" ./dtb
+            echo "Copied DTB successfully"
+          else
+            echo "Warning: No DTB found. AK3 will use the device's stock DTB."
+          fi
+
+          # Create safe anykernel.sh (Removed DTBO logic entirely)
           cat > anykernel.sh << 'ANYKERNELEOF'
           properties() { '
           kernel.string=Valeryn-KSU by ReSukiSU
@@ -191,17 +155,16 @@ jobs:
           device.name1=chime
           device.name2=citrus
           device.name3=lime
+          device.name4=power
           '; }
           BLOCK=/dev/block/bootdevice/by-name/boot;
           IS_SLOT_DEVICE=0;
           RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          
           . tools/ak3-core.sh;
           split_boot;
           flash_boot;
-          if [ -f "$TMPDIR/dtbo.img" ]; then
-            ui_print "Flashing DTBO...";
-            dd if="$TMPDIR/dtbo.img" of=/dev/block/bootdevice/by-name/dtbo;
-          fi
           ANYKERNELEOF
 
           zip -r9 ../${{ env.KERNEL_NAME }}-AnyKernel3.zip *
@@ -212,12 +175,3 @@ jobs:
           name: ${{ env.KERNEL_NAME }}-AnyKernel3
           path: ${{ env.KERNEL_NAME }}-AnyKernel3.zip
           retention-days: 7
-
-      - name: Upload Build Info
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Build-Logs
-          path: |
-            out/.config
-            build.log
