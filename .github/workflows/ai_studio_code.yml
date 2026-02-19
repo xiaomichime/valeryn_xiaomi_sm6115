@@ -118,7 +118,7 @@ jobs:
           cd AnyKernel3
           rm -rf .git patch ramdisk modules
           
-          # 1. Copy the pure kernel
+          # 1. Copy the pure kernel (DO NOT APPEND DTB)
           if; then
             cp ../out/arch/arm64/boot/Image.gz .
             echo "Copied Image.gz"
@@ -128,7 +128,9 @@ jobs:
           fi
 
           # 2. Find and copy the DTB as a separate file
+          # AnyKernel3 natively injects 'dtb' into header v2 boot images
           DTB_PATH=$(find ../out/arch/arm64/boot/dts -name "*chime*.dtb" -o -name "*bengal*.dtb" -o -name "*sm6115*.dtb" | head -1)
+          
           if; then
             cp "$DTB_PATH" ./dtb
             echo "Copied DTB successfully"
