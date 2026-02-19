@@ -57,11 +57,14 @@ jobs:
             mv susfs4ksu-main susfs
           }
           
-          # Smart Copy: Find and move files regardless of repo structure
+          # 1. Copy Header Files (CRITICAL FIX: Added susfs_def.h)
           find susfs -name "susfs.h" -exec cp {} include/linux/ \;
+          find susfs -name "susfs_def.h" -exec cp {} include/linux/ \;
+          
+          # 2. Copy Source File
           find susfs -name "susfs.c" -exec cp {} fs/ \;
 
-          # Apply SUSFS Patches (Specifically for 4.19)
+          # 3. Apply SUSFS Patches (Specifically for 4.19)
           FS_PATCH=$(find susfs -name "fs_susfs.patch" | grep "4.19" | head -1)
           SYS_PATCH=$(find susfs -name "non_gki_sysctl.patch" | grep "4.19" | head -1)
           KSU_PATCH=$(find susfs -name "*susfs.patch*" | grep "KernelSU" | head -1)
@@ -77,28 +80,24 @@ jobs:
 
       - name: Fix Compilation Errors (Menu.c & RCU/BPF)
         run: |
-          # 1. Fix 'no member named last_state_idx' in menu.c
+          # Fix 'no member named last_state_idx' in menu.c
           if [ -f "drivers/cpuidle/governors/menu.c" ]; then
-            echo "Patching menu.c to fix missing member error..."
             sed -i 's/data->last_state_idx = idx;/\/\/ data->last_state_idx = idx;/g' drivers/cpuidle/governors/menu.c
             sed -i 's/return data->last_state_idx;/\/\/ return data->last_state_idx;\n\t\treturn 0;/g' drivers/cpuidle/governors/menu.c
           fi
 
-          # 2. Fix RCU Kconfig
+          # Fix RCU Kconfig
           if [ -f "kernel/rcu/Kconfig" ]; then
             sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
           fi
 
-          # 3. Fix BPF sysctl
+          # Fix BPF sysctl
           if [ -f "kernel/sysctl.c" ] && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
             perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
           fi
 
       - name: Configure Kernel
         run: |
-          # 1. Find the defconfig path relative to arch/arm64/configs/
-          # We need to pass the EXACT path that 'make' expects (e.g., vendor/chime-stock_defconfig)
-          
           if [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
             DEFCONFIG="vendor/chime-stock_defconfig"
           elif [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
@@ -111,12 +110,11 @@ jobs:
           echo "Using defconfig: $DEFCONFIG"
           make ARCH=arm64 O=out $DEFCONFIG
 
-          # 2. Disable IKCONFIG to prevent 'config_data.gz' build error
-          # This fixes the "No rule to make target..." error
+          # Disable IKCONFIG to prevent build errors
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
-          # 3. Enable KernelSU and SUSFS
+          # Enable KernelSU and SUSFS
           cat >> out/.config << 'CONFIGEOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
