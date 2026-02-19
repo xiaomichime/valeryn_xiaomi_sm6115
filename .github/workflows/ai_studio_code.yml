@@ -1,0 +1,201 @@
+name: Build Kernel with ReSukiSU + SUSFS (AnyKernel3)
+
+on:
+  workflow_dispatch: # Manual trigger only
+
+env:
+  KERNEL_NAME: Valeryn-KSU-SUSFS
+  DEVICE_NAME: chime
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libelf-dev libssl-dev libncurses5-dev \
+            device-tree-compiler python3 python3-pip zip unzip git patch ccache \
+            perl gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi libfl-dev libmpc-dev libmpfr-dev libgmp-dev
+
+      - name: Setup Proton Clang toolchain
+        run: |
+          mkdir -p $HOME/toolchains
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/toolchains/clang
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
+          echo "LLVM=$HOME/toolchains/clang" >> $GITHUB_ENV
+
+      - name: Integrate ReSukiSU
+        run: |
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          if [ -d "drivers/kernelsu" ]; then
+            echo "KernelSU already integrated, skipping symlink"
+          else
+            ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
+          fi
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
+      - name: Integrate SUSFS
+        run: |
+          # Clone SUSFS Patches and Files
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4linux.git susfs
+          
+          # Copy SUSFS files to kernel source
+          cp susfs/kernel/include/linux/susfs.h include/linux/
+          cp susfs/kernel/fs/susfs.c fs/
+
+          # Apply SUSFS Patches (Assuming 4.19 kernel for chime)
+          # We apply patches for fs, sysctl, and ReSukiSU integration
+          cp susfs/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          
+          echo "Applying SUSFS patches..."
+          patch -p1 < susfs/patches/4.19/fs_susfs.patch || echo "FS patch failed, check manually"
+          patch -p1 < susfs/patches/4.19/non_gki_sysctl.patch || echo "Sysctl patch failed, check manually"
+          
+          cd KernelSU
+          patch -p1 < 10_enable_susfs_for_ksu.patch || echo "KSU SUSFS patch failed"
+          cd ..
+
+      - name: Apply Kernel Patches (RCU & BPF)
+        run: |
+          if [ -f "kernel/rcu/Kconfig" ]; then
+            sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
+          fi
+          if [ -f "kernel/sysctl.c" ] && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
+            perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
+          fi
+
+      - name: Configure Kernel
+        run: |
+          # Strictly search only for chime-stock_defconfig
+          DEFCONFIG_PATH=""
+          if [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
+            DEFCONFIG_PATH="chime-stock_defconfig"
+          elif [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
+            DEFCONFIG_PATH="vendor/chime-stock_defconfig"
+          fi
+
+          if [ -z "$DEFCONFIG_PATH" ]; then
+            echo "Error: chime-stock_defconfig not found!"
+            exit 1
+          fi
+
+          make ARCH=arm64 O=out $DEFCONFIG_PATH
+
+          cat >> out/.config << 'CONFIGEOF'
+          # KernelSU
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+          
+          # SUSFS
+          CONFIG_SUSFS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_SUSFS_SHOW_SPOOFED_PROCFS=y
+          CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          
+          # General Requirements
+          CONFIG_KPM=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_KPROBES=y
+          # CONFIG_BPF is not set
+          # CONFIG_BPF_SYSCALL is not set
+          CONFIG_TASKS_TRACE_RCU=y
+          CONFIGEOF
+
+          make ARCH=arm64 O=out olddefconfig
+
+      - name: Build Kernel
+        run: |
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          make -j$(nproc) ARCH=arm64 O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            2>&1 | tee build.log
+
+      - name: Prepare DTB and DTBO
+        run: |
+          make ARCH=arm64 O=out dtbs -j$(nproc) CC=clang CROSS_COMPILE=aarch64-linux-gnu-
+          
+          DTB_PATH=$(find out/arch/arm64/boot/dts -name "*chime*.dtb" | head -1)
+          if [ -f "$DTB_PATH" ] && [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            cat out/arch/arm64/boot/Image.gz "$DTB_PATH" > out/arch/arm64/boot/Image.gz-dtb
+            echo "KERNEL_FILE=Image.gz-dtb" >> $GITHUB_ENV
+          else
+            echo "KERNEL_FILE=Image.gz" >> $GITHUB_ENV
+          fi
+
+          DTBO_FILES=$(find out/arch/arm64/boot/dts -name "*.dtbo")
+          if [ -n "$DTBO_FILES" ]; then
+            cat $DTBO_FILES > out/arch/arm64/boot/dtbo.img
+          fi
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cd AnyKernel3
+          rm -rf .git patch ramdisk modules
+          cp ../out/arch/arm64/boot/${{ env.KERNEL_FILE }} . || cp ../out/arch/arm64/boot/Image .
+          [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
+
+          cat > anykernel.sh << 'ANYKERNELEOF'
+          properties() { '
+          kernel.string=Valeryn-KSU + SUSFS by ReSukiSU
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          device.name1=chime
+          device.name2=citrus
+          device.name3=lime
+          '; }
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          if [ -f "$TMPDIR/dtbo.img" ]; then
+            ui_print "Flashing DTBO...";
+            dd if="$TMPDIR/dtbo.img" of=/dev/block/bootdevice/by-name/dtbo;
+          fi
+          ANYKERNELEOF
+
+          zip -r9 ../${{ env.KERNEL_NAME }}-AnyKernel3.zip *
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-Build
+          path: |
+            *.zip
+            out/arch/arm64/boot/Image*
+            out/.config
+          retention-days: 7
+
+      - name: Upload Build Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-susfs
+          path: build.log
