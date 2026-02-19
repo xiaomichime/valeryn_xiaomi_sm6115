@@ -1,10 +1,10 @@
-name: Build Kernel with ReSukiSU (AnyKernel3)
+name: Build Kernel with SukiSU-Ultra (AnyKernel3)
 
 on:
   workflow_dispatch:
 
 env:
-  KERNEL_NAME: Valeryn-KSU
+  KERNEL_NAME: Valeryn-SukiSU-Ultra
   DEVICE_NAME: chime
 
 jobs:
@@ -33,32 +33,25 @@ jobs:
           echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
           echo "LLVM=$HOME/toolchains/clang" >> $GITHUB_ENV
 
-      - name: Integrate ReSukiSU
+      - name: Integrate SukiSU-Ultra
         run: |
-          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
-          
-          if; then
-            echo "KernelSU directory exists"
-          else
-            ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
-          fi
-          
-          if ! grep -q "kernelsu" drivers/Makefile; then
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          fi
-          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          fi
+          echo "Running SukiSU-Ultra setup script..."
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
 
       - name: Fix Compilation Errors
         run: |
+          # 1. Fix 'no member named last_state_idx' in menu.c
           if; then
             sed -i 's/data->last_state_idx = idx;/\/\/ data->last_state_idx = idx;/g' drivers/cpuidle/governors/menu.c
             sed -i 's/return data->last_state_idx;/\/\/ return data->last_state_idx;\n\t\treturn 0;/g' drivers/cpuidle/governors/menu.c
           fi
+          
+          # 2. Fix RCU Kconfig for KSU support
           if; then
             sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
           fi
+          
+          # 3. Fix BPF sysctl undefined reference
           if && grep -q "bpf_stats_enabled" kernel/sysctl.c; then
             perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
           fi
@@ -81,7 +74,7 @@ jobs:
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
-          # Enable KernelSU ONLY
+          # Enable SukiSU-Ultra (KernelSU) configs
           cat >> out/.config << 'CONFIGEOF'
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
@@ -144,10 +137,10 @@ jobs:
             echo "Warning: No DTB found. AK3 will use the device's stock DTB."
           fi
 
-          # Create safe anykernel.sh (Removed DTBO logic entirely)
+          # Create safe anykernel.sh
           cat > anykernel.sh << 'ANYKERNELEOF'
           properties() { '
-          kernel.string=Valeryn-KSU by ReSukiSU
+          kernel.string=Valeryn by SukiSU-Ultra
           do.devicecheck=1
           do.modules=0
           do.systemless=1
