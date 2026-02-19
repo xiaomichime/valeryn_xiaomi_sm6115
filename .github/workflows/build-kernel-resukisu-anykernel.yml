@@ -1,0 +1,460 @@
+name: Build Kernel with ReSukiSU (AnyKernel3)
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_NAME: Valeryn-KSU
+  DEVICE_NAME: chime
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            libncurses5-dev \
+            device-tree-compiler \
+            python3 \
+            python3-pip \
+            zip \
+            unzip \
+            git \
+            patch \
+            ccache \
+            perl \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi \
+            libfl-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libgmp-dev
+
+      - name: Setup Proton Clang toolchain
+        run: |
+          mkdir -p $HOME/toolchains
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/toolchains/clang
+
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          echo "CLANG_PATH=$HOME/toolchains/clang" >> $GITHUB_ENV
+          echo "LLVM=$HOME/toolchains/clang" >> $GITHUB_ENV
+
+      - name: Clone ReSukiSU
+        run: git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+
+      - name: Integrate ReSukiSU
+        run: |
+          # Check if KernelSU kernel directory exists in drivers
+          if [ -d "drivers/kernelsu" ]; then
+            echo "KernelSU already integrated in drivers, skipping symlink"
+          else
+            ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
+          fi
+
+          # Add to Makefile if not already present
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+
+          # Add to Kconfig if not already present
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
+      - name: Fix TASKS_TRACE_RCU Kconfig
+        run: |
+          if [ -f "kernel/rcu/Kconfig" ]; then
+            sed -i 's/def_bool 0/def_bool y/' kernel/rcu/Kconfig
+            echo "Fixed TASKS_TRACE_RCU in Kconfig:"
+            grep -A2 "config TASKS_TRACE_RCU" kernel/rcu/Kconfig || echo "TASKS_TRACE_RCU not found in Kconfig"
+          else
+            echo "kernel/rcu/Kconfig not found, skipping"
+          fi
+
+      - name: Fix BPF sysctl missing ifdef guard
+        run: |
+          if [ -f "kernel/sysctl.c" ]; then
+            if grep -q "bpf_stats_enabled" kernel/sysctl.c; then
+              perl -i -0pe 's/(\t\{\n\t\t\.procname\t= "bpf_stats_enabled",.*?\n\t\},)/#ifdef CONFIG_BPF_SYSCALL\n$1\n#endif/s' kernel/sysctl.c
+              echo "Fixed bpf_stats_enabled sysctl entry"
+            else
+              echo "bpf_stats_enabled not found in sysctl.c, skipping"
+            fi
+          fi
+
+      - name: Configure kernel for Non-GKI
+        run: |
+          # Use the correct defconfig for chime
+          DEFCONFIG=""
+          if [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
+            DEFCONFIG="chime-stock_defconfig"
+          elif [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
+            DEFCONFIG="vendor/chime-stock_defconfig"
+          elif [ -f "arch/arm64/configs/chime_defconfig" ]; then
+            DEFCONFIG="chime_defconfig"
+          else
+            echo "Available defconfigs:"
+            ls arch/arm64/configs/*.defconfig 2>/dev/null || ls arch/arm64/configs/vendor/*.defconfig 2>/dev/null || echo "No defconfigs found"
+            exit 1
+          fi
+
+          echo "Using defconfig: $DEFCONFIG"
+          make ARCH=arm64 O=out $DEFCONFIG
+
+          cat >> out/.config << 'CONFIGEOF'
+
+#
+# KernelSU Configuration for Non-GKI (4.19)
+#
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+# CONFIG_KSU_SUSFS is not set
+# CONFIG_KSU_TRACEPOINT_HOOK is not set
+CONFIG_KPM=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_KPROBES=y
+
+#
+# Disable BPF (fixes undefined GKI vendor hooks in non-GKI kernel)
+#
+# CONFIG_BPF is not set
+# CONFIG_BPF_SYSCALL is not set
+# CONFIG_BPF_JIT is not set
+# CONFIG_BPF_JIT_ALWAYS_ON is not set
+# CONFIG_BPF_EVENTS is not set
+
+#
+# RCU Tasks Trace (fixes trc_reader_need_end error)
+#
+CONFIG_TASKS_TRACE_RCU=y
+CONFIGEOF
+
+          make ARCH=arm64 O=out olddefconfig
+
+          echo "=== Final KSU Configuration ==="
+          grep -E "CONFIG_KSU|CONFIG_KPM" out/.config
+
+          echo "=== BPF Status (should be disabled) ==="
+          grep -E "CONFIG_BPF" out/.config || echo "BPF disabled"
+
+      - name: Build kernel
+        run: |
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+
+          make -j$(nproc) \
+            ARCH=arm64 \
+            O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            2>&1 | tee build.log
+
+      - name: Check build result and prepare kernel
+        run: |
+          KERNEL_FILE=""
+
+          # Check for different kernel outputs
+          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            KERNEL_FILE="Image.gz"
+            echo "Kernel built successfully: Image.gz"
+            ls -la out/arch/arm64/boot/Image.gz
+          elif [ -f "out/arch/arm64/boot/Image" ]; then
+            KERNEL_FILE="Image"
+            echo "Kernel built successfully: Image (uncompressed)"
+            ls -la out/arch/arm64/boot/Image
+          else
+            echo "Kernel build failed. Checking for errors..."
+            tail -n 100 build.log
+            exit 1
+          fi
+
+          echo "KERNEL_FILE=$KERNEL_FILE" >> $GITHUB_ENV
+
+      - name: Build and append DTB
+        run: |
+          echo "=== Building DTBs ==="
+
+          # Build dtbs
+          make ARCH=arm64 O=out dtbs -j$(nproc) \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu-
+
+          echo "=== Finding DTB files ==="
+          find out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null | head -20
+
+          # Find the correct DTB for SM6115/chime
+          DTB_PATH=""
+          
+          # Try multiple patterns to find the right DTB
+          for pattern in "*chime*" "*sm6115*" "*bengal*" "*trinket*"; do
+            DTB_PATH=$(find out/arch/arm64/boot/dts -name "${pattern}.dtb" 2>/dev/null | head -1)
+            if [ -n "$DTB_PATH" ]; then
+              break
+            fi
+          done
+
+          # If still not found, try any qcom dtb
+          if [ -z "$DTB_PATH" ]; then
+            DTB_PATH=$(find out/arch/arm64/boot/dts/qcom -name "*.dtb" 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$DTB_PATH" ]; then
+            echo "Found DTB: $DTB_PATH"
+            cp "$DTB_PATH" out/arch/arm64/boot/qcom.dtb
+
+            # Append DTB to kernel if we have Image.gz
+            if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+              echo "=== Creating Image.gz-dtb ==="
+              cat out/arch/arm64/boot/Image.gz out/arch/arm64/boot/qcom.dtb > out/arch/arm64/boot/Image.gz-dtb
+              ls -la out/arch/arm64/boot/Image.gz-dtb
+              echo "KERNEL_FILE=Image.gz-dtb" >> $GITHUB_ENV
+            fi
+          else
+            echo "Warning: No DTB found, using kernel without DTB appended"
+            echo "DTB_FILE=" >> $GITHUB_ENV
+          fi
+
+      - name: Build DTBO image
+        run: |
+          echo "=== Building DTBO image ==="
+
+          # Find all dtbo overlay files
+          DTBO_FILES=$(find out/arch/arm64/boot/dts -name "*.dtbo" 2>/dev/null)
+
+          if [ -n "$DTBO_FILES" ]; then
+            echo "Found dtbo files:"
+            echo "$DTBO_FILES"
+
+            # Create list file for mkdtboimg
+            DTBO_LIST=""
+            for f in $DTBO_FILES; do
+              DTBO_LIST="$DTBO_LIST $f"
+            done
+
+            # Install mkdtboimg if available
+            pip3 install dtc 2>/dev/null || true
+
+            # Try to create dtbo.img
+            if command -v mkdtboimg &> /dev/null; then
+              mkdtboimg create out/arch/arm64/boot/dtbo.img $DTBO_LIST
+              echo "Created dtbo.img with mkdtboimg"
+            else
+              echo "mkdtboimg not available, trying alternative methods..."
+              
+              # Try using dtc to concatenate
+              DTBO_IMG="out/arch/arm64/boot/dtbo.img"
+              rm -f "$DTBO_IMG"
+              
+              # Create a simple dtbo.img header and concatenate dtbos
+              # This is a simplified approach - may need adjustment
+              for dtbo in $DTBO_FILES; do
+                cat "$dtbo" >> "$DTBO_IMG"
+              done
+              echo "Created concatenated dtbo.img"
+            fi
+
+            if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+              ls -la out/arch/arm64/boot/dtbo.img
+              echo "DTBO_BUILT=1" >> $GITHUB_ENV
+            else
+              echo "dtbo.img not created"
+              echo "DTBO_BUILT=0" >> $GITHUB_ENV
+            fi
+          else
+            echo "No dtbo files found in kernel source"
+            echo "DTBO_BUILT=0" >> $GITHUB_ENV
+          fi
+
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+      - name: Prepare AnyKernel3
+        run: |
+          cd AnyKernel3
+
+          # Remove default/example files we don't need
+          rm -rf patch ramdisk modules
+
+          # Copy our built kernel
+          if [ -f "../out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp ../out/arch/arm64/boot/Image.gz-dtb .
+            echo "Using Image.gz-dtb"
+          elif [ -f "../out/arch/arm64/boot/Image.gz" ]; then
+            cp ../out/arch/arm64/boot/Image.gz .
+            echo "Using Image.gz"
+          elif [ -f "../out/arch/arm64/boot/Image" ]; then
+            cp ../out/arch/arm64/boot/Image .
+            echo "Using Image (uncompressed)"
+          else
+            echo "ERROR: No kernel file found!"
+            exit 1
+          fi
+
+          # Copy dtbo.img if built
+          if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
+            cp ../out/arch/arm64/boot/dtbo.img .
+            echo "Including dtbo.img"
+          fi
+
+          # Create anykernel.sh for Xiaomi SM6115 (chime platform)
+          # NOT A/B slot device
+          cat > anykernel.sh << 'ANYKERNELEOF'
+### AnyKernel3 Ramdisk Mod Script
+## osm0sis @ xda-developers
+
+### AnyKernel setup
+# global properties
+properties() { '
+kernel.string=Valeryn-KSU by ReSukiSU
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=chime
+device.name2=citrus
+device.name3=lime
+device.name4=blossom
+device.name5=sunny
+device.name6=star
+device.name7=lemon
+supported.versions=
+supported.patchlevels=
+supported.vendorpatchlevels=
+'; } # end properties
+
+### AnyKernel install
+## boot files attributes
+boot_attributes() {
+set_perm_recursive 0 0 755 644 $RAMDISK/*;
+set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+} # end attributes
+
+# boot shell variables
+# Xiaomi SM6115 devices are NOT A/B slot
+BLOCK=/dev/block/bootdevice/by-name/boot;
+IS_SLOT_DEVICE=0;
+RAMDISK_COMPRESSION=auto;
+PATCH_VBMETA_FLAG=auto;
+
+# DTBO partition path
+DTBO=/dev/block/bootdevice/by-name/dtbo;
+
+# import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+. tools/ak3-core.sh;
+
+# boot install
+split_boot;
+flash_boot;
+
+# Flash DTBO if dtbo.img is present
+if [ -f "$TMPDIR/dtbo.img" ]; then
+  ui_print "Flashing DTBO...";
+  ui_print "Path: $DTBO";
+  dd if=/dev/zero of=$DTBO 2>/dev/null || true;
+  cat "$TMPDIR/dtbo.img" > $DTBO || ui_print "DTBO flash failed!";
+fi;
+## end boot install
+ANYKERNELEOF
+
+          # Make script executable
+          chmod 755 anykernel.sh
+
+          echo "=== AnyKernel3 contents ==="
+          ls -la
+
+          echo "=== anykernel.sh preview ==="
+          cat anykernel.sh
+
+      - name: Create flashable zip
+        run: |
+          cd AnyKernel3
+
+          # Create the flashable zip
+          zip -r9 ../${{ env.KERNEL_NAME }}-AnyKernel3.zip *
+
+          cd ..
+
+          echo "=== Flashable zip created ==="
+          ls -la ${{ env.KERNEL_NAME }}-AnyKernel3.zip
+
+          # Verify zip contents
+          echo "=== Zip contents ==="
+          unzip -l ${{ env.KERNEL_NAME }}-AnyKernel3.zip
+
+          # Also create kernel artifacts
+          mkdir -p artifacts
+
+          # Copy kernel
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb artifacts/
+          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            cp out/arch/arm64/boot/Image.gz artifacts/
+          elif [ -f "out/arch/arm64/boot/Image" ]; then
+            cp out/arch/arm64/boot/Image artifacts/
+          fi
+
+          # Copy DTB and DTBO separately
+          cp out/arch/arm64/boot/qcom.dtb artifacts/ 2>/dev/null || true
+          cp out/arch/arm64/boot/dtbo.img artifacts/ 2>/dev/null || true
+
+          # Copy kernel modules
+          find out -name "*.ko" -exec cp {} artifacts/ \; 2>/dev/null || true
+
+          # Create info file
+          echo "Kernel: ${{ env.KERNEL_NAME }}" > artifacts/info.txt
+          echo "Build Date: $(date)" >> artifacts/info.txt
+          echo "Kernel Type: Non-GKI (4.19)" >> artifacts/info.txt
+          echo "Hook Type: MANUAL_HOOK" >> artifacts/info.txt
+          echo "Device: Xiaomi SM6115 (chime)" >> artifacts/info.txt
+          echo "Flashable: Yes (AnyKernel3)" >> artifacts/info.txt
+          cat out/.config | grep -E "CONFIG_KSU|CONFIG_KPM" >> artifacts/info.txt 2>/dev/null || true
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-AnyKernel3
+          path: ${{ env.KERNEL_NAME }}-AnyKernel3.zip
+          retention-days: 30
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-kernel
+          path: artifacts/*
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
