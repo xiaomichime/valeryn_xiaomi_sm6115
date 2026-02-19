@@ -37,14 +37,12 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           
-          # Symlink logic
           if [ -d "drivers/kernelsu" ]; then
             echo "KernelSU directory exists"
           else
             ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
           fi
           
-          # Makefile integration
           if ! grep -q "kernelsu" drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
@@ -52,7 +50,7 @@ jobs:
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
 
-      - name: Integrate SUSFS (Bulletproof Method)
+      - name: Integrate SUSFS
         run: |
           echo "=== Downloading SUSFS ==="
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs || {
@@ -62,38 +60,48 @@ jobs:
             mv susfs4ksu-main susfs
           }
 
+          echo "=== DEBUG: SUSFS File Structure ==="
+          ls -R susfs
+
           echo "=== Installing SUSFS Kernel Files ==="
-          # Copy to standard kernel locations (using find to be safe about source structure)
+          # Copy headers and source
           find susfs -name "susfs.h" -exec cp {} include/linux/ \;
           find susfs -name "susfs_def.h" -exec cp {} include/linux/ \;
           find susfs -name "susfs.c" -exec cp {} fs/ \;
 
           echo "=== Applying SUSFS Kernel Patches ==="
-          # Apply 4.19 specific patches
-          FS_PATCH=$(find susfs -name "fs_susfs.patch" | grep "4.19" | head -1)
-          SYS_PATCH=$(find susfs -name "non_gki_sysctl.patch" | grep "4.19" | head -1)
+          # Try to find the patch with a broader search pattern
+          # Standard name in this repo is often "50_add_susfs_in_kernel-4.19.patch"
+          FS_PATCH=$(find susfs -name "*kernel*4.19*.patch" | head -1)
+          
+          # If not found, try the old name
+          if [ -z "$FS_PATCH" ]; then
+             FS_PATCH=$(find susfs -name "fs_susfs.patch" | head -1)
+          fi
 
           if [ -f "$FS_PATCH" ]; then
-            patch -p1 < "$FS_PATCH" || echo "FS patch failed (might be already applied)"
+            echo "Applying Kernel Patch: $FS_PATCH"
+            patch -p1 < "$FS_PATCH" || echo "FS patch failed (check if already applied)"
           else
-            echo "ERROR: fs_susfs.patch not found!"
-          fi
-          
-          if [ -f "$SYS_PATCH" ]; then
-            patch -p1 < "$SYS_PATCH" || echo "Sysctl patch failed"
+            echo "CRITICAL ERROR: SUSFS Kernel Patch not found!"
+            echo "Available patches:"
+            find susfs -name "*.patch"
+            exit 1
           fi
 
           echo "=== Applying SUSFS to KernelSU ==="
-          # Apply the patch that bridges KSU and SUSFS
-          KSU_PATCH=$(find susfs -name "*susfs.patch*" | grep "KernelSU" | head -1)
-          
+          # Find the KSU integration patch
+          KSU_PATCH=$(find susfs -name "*enable_susfs_for_ksu.patch" | head -1)
+
           if [ -f "$KSU_PATCH" ]; then
             echo "Applying KSU Patch: $KSU_PATCH"
             cd KernelSU
             patch -p1 < "../$KSU_PATCH" || echo "KSU Patch failed"
             cd ..
           else
-            echo "ERROR: KSU patch not found!"
+            echo "CRITICAL ERROR: KSU Patch not found!"
+            echo "Available patches in susfs:"
+            find susfs -name "*.patch"
             exit 1
           fi
 
@@ -101,25 +109,10 @@ jobs:
           # 1. Copy the missing header DIRECTLY into the KernelSU folder
           find susfs -name "susfs_def.h" -exec cp {} KernelSU/kernel/ \;
           
-          # 2. Modify sucompat.c to include the local file instead of the system file
-          # This changes <linux/susfs_def.h> to "susfs_def.h"
+          # 2. Modify sucompat.c to include the local file
           if [ -f "KernelSU/kernel/sucompat.c" ]; then
             echo "Patching sucompat.c include path..."
             sed -i 's|#include <linux/susfs_def.h>|#include "susfs_def.h"|g' KernelSU/kernel/sucompat.c
-            
-            # Verify the change
-            grep "susfs_def.h" KernelSU/kernel/sucompat.c
-          else
-            echo "ERROR: sucompat.c not found!"
-            exit 1
-          fi
-          
-          # 3. Verify file existence
-          if [ -f "KernelSU/kernel/susfs_def.h" ]; then
-            echo "SUCCESS: susfs_def.h present in KernelSU/kernel/"
-          else
-            echo "ERROR: Failed to copy susfs_def.h to KernelSU/kernel/"
-            exit 1
           fi
 
       - name: Fix Compilation Errors
@@ -142,7 +135,6 @@ jobs:
 
       - name: Configure Kernel
         run: |
-          # STRICTLY use chime-stock_defconfig from vendor/
           if [ -f "arch/arm64/configs/vendor/chime-stock_defconfig" ]; then
             DEFCONFIG="vendor/chime-stock_defconfig"
           elif [ -f "arch/arm64/configs/chime-stock_defconfig" ]; then
@@ -155,7 +147,7 @@ jobs:
           echo "Using defconfig: $DEFCONFIG"
           make ARCH=arm64 O=out $DEFCONFIG
 
-          # Disable IKCONFIG to prevent build errors
+          # Disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG
           ./scripts/config --file out/.config --disable IKCONFIG_PROC
 
